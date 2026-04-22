@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, Self
@@ -37,6 +38,45 @@ class MemoryUsage(CamelCaseModel):
             ram_available=vm.available if override_memory is None else override_memory,
             swap_total=sm.total,
             swap_available=sm.free,
+        )
+
+    @classmethod
+    def from_nvidia_smi(cls, *, override_memory: int | None) -> Self:
+        """Report VRAM across all visible NVIDIA GPUs on the node.
+
+        Used on Linux/Nvidia nodes so the master constrains model placement by
+        VRAM rather than system RAM. Values are summed across all GPUs.
+        """
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        total_mib = 0
+        used_mib = 0
+        lines = [line for line in result.stdout.strip().splitlines() if line]
+        if not lines:
+            raise RuntimeError("nvidia-smi returned no GPUs")
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2:
+                raise RuntimeError(f"Unexpected nvidia-smi line: {line!r}")
+            total_mib += int(parts[0])
+            used_mib += int(parts[1])
+        mib = 1024 * 1024
+        total_bytes = total_mib * mib
+        available_bytes = (total_mib - used_mib) * mib
+        return cls.from_bytes(
+            ram_total=total_bytes,
+            ram_available=available_bytes if override_memory is None else override_memory,
+            swap_total=0,
+            swap_available=0,
         )
 
 

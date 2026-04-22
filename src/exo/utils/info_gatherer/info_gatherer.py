@@ -468,11 +468,33 @@ class InfoGatherer:
         )
         if self.memory_poll_rate is None:
             return
+
+        use_nvidia_smi = False
+        if shutil.which("nvidia-smi") is not None:
+            try:
+                await to_thread.run_sync(
+                    lambda: MemoryUsage.from_nvidia_smi(override_memory=override_memory)
+                )
+                use_nvidia_smi = True
+                logger.info("nvidia-smi available; reporting VRAM as node memory")
+            except Exception as e:
+                logger.info(
+                    f"nvidia-smi probe failed ({e.__class__.__name__}); "
+                    "reporting system RAM as node memory"
+                )
+
         while True:
             try:
-                await self.info_sender.send(
-                    MemoryUsage.from_psutil(override_memory=override_memory)
+                usage = (
+                    await to_thread.run_sync(
+                        lambda: MemoryUsage.from_nvidia_smi(
+                            override_memory=override_memory
+                        )
+                    )
+                    if use_nvidia_smi
+                    else MemoryUsage.from_psutil(override_memory=override_memory)
                 )
+                await self.info_sender.send(usage)
             except Exception as e:
                 logger.warning(f"Error gathering memory usage: {e}")
             await anyio.sleep(self.memory_poll_rate)
