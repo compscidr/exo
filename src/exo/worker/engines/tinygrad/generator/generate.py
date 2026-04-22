@@ -518,8 +518,11 @@ def _rank0_pipeline_generate(
             )
 
             if finish_reason is not None:
-                # Send stop to workers and end.
-                group.send_stop()
+                # Return; the enclosing try/finally will send exactly one STOP
+                # and drain the ring-echo. Sending STOP here too would leave
+                # a second STOP in the downstream rank's recv buffer that the
+                # *next* request would consume before its own prefill-hidden,
+                # causing the next request's worker loop to exit in ~ms.
                 return
 
             # ── Decode step: embed single token on rank 0, ship hidden ────
