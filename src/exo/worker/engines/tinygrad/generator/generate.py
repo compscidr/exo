@@ -467,6 +467,14 @@ def _rank0_pipeline_generate(
 
         # ── Decode loop ───────────────────────────────────────────────────────
         generation_start = time.time()
+        # Accumulators to break down per-decode wall clock. Logged every N
+        # tokens so we can see whether rank-0 local forward, the outbound
+        # send, or the worker-roundtrip dominates.
+        _inst_local_forward_s = 0.0
+        _inst_send_s = 0.0
+        _inst_recv_s = 0.0
+        _inst_samples = 0
+        _inst_every = 20
         for token_idx in range(max_tokens):
             token_text: str = tokenizer.decode([token_id])  # pyright: ignore[reportAny]
 
@@ -515,6 +523,7 @@ def _rank0_pipeline_generate(
                 return
 
             # ── Decode step: embed single token on rank 0, ship hidden ────
+            _inst_t0 = time.perf_counter()
             tok_tensor = Tensor([[token_id]], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
             # CRITICAL: pass position_offset as a Tensor (not int) so
             # grouped_query_attention takes the "decode" branch that attends
@@ -533,12 +542,36 @@ def _rank0_pipeline_generate(
                 cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
                 cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
             decode_hidden = decode_hidden.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+            _inst_t1 = time.perf_counter()
 
             decode_np = _tensor_to_np(decode_hidden)
             group.send_hidden(decode_np)
+            _inst_t2 = time.perf_counter()
 
             token_id, stop = group.recv_token()
+            _inst_t3 = time.perf_counter()
             position += 1
+
+            _inst_local_forward_s += _inst_t1 - _inst_t0
+            _inst_send_s += _inst_t2 - _inst_t1
+            _inst_recv_s += _inst_t3 - _inst_t2
+            _inst_samples += 1
+            if _inst_samples >= _inst_every:
+                import sys as _sys
+                total_s = _inst_local_forward_s + _inst_send_s + _inst_recv_s
+                print(
+                    f"[pipeline rank 0 decode {_inst_every}-token avg] "
+                    f"local_fwd={1000*_inst_local_forward_s/_inst_every:.1f}ms "
+                    f"send={1000*_inst_send_s/_inst_every:.1f}ms "
+                    f"worker_rtt={1000*_inst_recv_s/_inst_every:.1f}ms "
+                    f"total={1000*total_s/_inst_every:.1f}ms "
+                    f"tps={_inst_every/max(total_s, 1e-9):.2f}",
+                    file=_sys.stderr, flush=True,
+                )
+                _inst_local_forward_s = 0.0
+                _inst_send_s = 0.0
+                _inst_recv_s = 0.0
+                _inst_samples = 0
 
     finally:
         from exo.worker.engines.tinygrad.pipeline_group import TAG_STOP
