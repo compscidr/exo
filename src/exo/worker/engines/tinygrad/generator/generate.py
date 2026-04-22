@@ -1,8 +1,14 @@
+import contextlib
 import struct
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from exo.worker.engines.tinygrad.pipeline_group import PipelineGroup
 
 from tinygrad.dtype import dtypes
 from tinygrad.engine.jit import TinyJit
@@ -93,15 +99,43 @@ def _build_jit_decode(
 
     return decode
 
-def tinygrad_generate(
+
+def _tensor_to_np(t: Tensor) -> "np.ndarray[Any, np.dtype[np.float32]]":
+    """Convert a tinygrad Tensor to a writable fp32 numpy ndarray for the pipeline transport.
+
+    `.cast(float32)` runs on the device *before* `.numpy()` so the conversion
+    is a proper dtype cast — not a host-side reinterpret of the storage bytes
+    (which would happen if `.numpy()` was called on a bf16 tensor, since
+    numpy has no native bf16 and tinygrad may expose bf16 storage as uint16).
+    """
+    raw: Any = t.cast(dtypes.float32).numpy()
+    result: np.ndarray[Any, np.dtype[np.float32]] = raw  # pyright: ignore[reportAny]
+    return result
+
+
+def _make_kv_cache(model: TransformerWeights) -> KVCache:
+    """Allocate and realize a fresh KV cache for this rank's layers."""
+    config = model.config
+    num_layers = len(model.layers)
+    cache = KVCache(
+        num_layers=num_layers,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        max_seq_len=min(config.max_position_embeddings, 4096),
+    )
+    for i in range(num_layers):
+        cache.keys[i] = cache.keys[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+        cache.values[i] = cache.values[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+    return cache
+
+
+def _single_rank_generate(
     model: TransformerWeights,
     tokenizer: Any,  # pyright: ignore[reportAny]
     task: TextGenerationTaskParams,
     prompt: str,
-    kv_prefix_cache: Any = None,  # pyright: ignore[reportAny]
-    on_prefill_progress: Callable[[int, int], None] | None = None,
-    group: None = None,
 ) -> Generator[GenerationResponse]:
+    """Single-rank (no pipeline) generation — the original code path."""
     input_ids = _encode_prompt(tokenizer, prompt)
 
     max_tokens = task.max_output_tokens or DEFAULT_MAX_TOKENS
@@ -122,18 +156,7 @@ def tinygrad_generate(
 
     if state is None:
         # First request: create cache, JIT, and pre-allocate buffers
-        config = model.config
-        cache = KVCache(
-            num_layers=len(model.layers),
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            max_seq_len=min(config.max_position_embeddings, 4096),
-        )
-        # Realize cache tensors — Tensor.zeros() produces lazy/const tensors
-        # that TinyJit rejects as inputs. Force device buffer allocation.
-        for i in range(len(model.layers)):
-            cache.keys[i] = cache.keys[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-            cache.values[i] = cache.values[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+        cache = _make_kv_cache(model)
         jit_decode = _build_jit_decode(model, cache)
         input_buffer = Tensor.empty(1, 1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
         position_buffer = Tensor.empty(1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
@@ -270,7 +293,282 @@ def tinygrad_generate(
             cache.values[i] = results[1 + num_layers + i]
         position += 1
 
-def warmup_inference(model: TransformerWeights, tokenizer: Any, group: None = None) -> int:  # pyright: ignore[reportAny]
+
+def _worker_pipeline_loop(
+    model: TransformerWeights,
+    group: "PipelineGroup",
+    is_last: bool,
+) -> None:
+    """Non-rank-0 pipeline worker loop.
+
+    Receives hidden states from the previous rank, runs forward_pass on the
+    local layer slice, then either:
+    - sends the output hidden state to the next rank (middle ranks), or
+    - samples a token and sends it back to rank 0 (last rank).
+
+    Runs until a TAG_STOP is received, then propagates the stop signal and returns.
+    """
+    from exo.worker.engines.tinygrad.pipeline_group import (
+        TAG_HIDDEN,
+        TAG_STOP,
+        decode_hidden,
+    )
+
+    cache = _make_kv_cache(model)
+
+    position: int = 0
+    first = True
+
+    while True:
+        tag, payload = group.recv_any()
+
+        if tag == TAG_STOP:
+            # Propagate stop downstream and exit.
+            group.send_stop()
+            return
+
+        if tag == TAG_HIDDEN:
+            arr = decode_hidden(payload)
+            # arr shape: [batch, seq_len, hidden_dim]
+            arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
+            seq_len = int(arr_shape[1])
+
+            # The wire format is fp32 for precision fidelity, but the model's
+            # internal activation dtype is typically fp16 (matching rope_cos).
+            # Cast to match so forward_pass's matmuls don't hit dtype mismatch.
+            hidden = (
+                Tensor(arr)
+                .cast(model.rope_cos.dtype)  # pyright: ignore[reportUnknownMemberType]
+                .contiguous()
+                .realize()
+            )
+
+            # Prefill: pass position_offset=0 (int) so attention uses the
+            # local-only seq_len×seq_len path (correct and efficient here).
+            # Decode (first=False, seq_len=1): pass position_offset as a
+            # Tensor so attention takes the cache-reading branch — otherwise
+            # it ignores all prefill/prior-decode entries and produces garbage.
+            position_offset: "int | Tensor"
+            if first:
+                position_offset = 0
+            else:
+                position_offset = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+
+            with Context(BEAM=0):
+                output, _ = forward_pass(
+                    model, hidden, cache,
+                    position_offset=position_offset,
+                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                )
+                for i in range(len(cache.keys)):
+                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                output = output.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+
+            if is_last:
+                # Last rank: sample a token from the logits and send back to rank 0.
+                token_result = sample_token(output, temperature=DEFAULT_TEMPERATURE, top_p=DEFAULT_TOP_P)
+                group.send_token(token_result.token_id, stop=False)
+            else:
+                # Middle rank: convert hidden state to fp16 numpy and forward downstream.
+                hidden_np = _tensor_to_np(output)
+                group.send_hidden(hidden_np)
+
+            position += seq_len
+            first = False
+
+        else:
+            # TAG_TOKEN is unexpected on a worker rank in this design.
+            import warnings
+            warnings.warn(
+                f"[pipeline worker rank {group.rank}] received unexpected tag={tag}; ignoring",
+                stacklevel=1,
+            )
+
+
+def _rank0_pipeline_generate(
+    model: TransformerWeights,
+    tokenizer: Any,  # pyright: ignore[reportAny]
+    task: TextGenerationTaskParams,
+    prompt: str,
+    group: "PipelineGroup",
+) -> Generator[GenerationResponse]:
+    """Rank-0 pipeline generator.
+
+    Handles prefill locally, ships the hidden state downstream, waits for the
+    last rank to sample a token, then drives the decode loop.  Wraps everything
+    in try/finally so that the pipeline workers always receive a STOP signal even
+    if the caller drops the generator early (e.g., warmup after N tokens).
+    """
+    input_ids = _encode_prompt(tokenizer, prompt)
+
+    max_tokens = task.max_output_tokens or DEFAULT_MAX_TOKENS
+    # temperature, top_p, and logprob settings are not used on rank 0:
+    # rank 0 has no lm_head so it cannot sample; sampling is done by the last rank.
+
+    eos_ids = _get_eos_ids(tokenizer, model.config)
+    prompt_tokens = len(input_ids)
+    input_ids = _pad_to_bucket(input_ids)
+
+    if not input_ids:
+        raise ValueError("Prompt must contain at least one token")
+
+    cache = _make_kv_cache(model)
+
+    prefill_start = time.time()
+
+    try:
+        # ── Prefill ──────────────────────────────────────────────────────────
+        prompt_tensor = Tensor(input_ids, dtype=dtypes.int32).reshape(1, -1).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+        with Context(BEAM=0):
+            hidden_or_logits, _ = forward_pass(
+                model, prompt_tensor, cache,
+                position_offset=0,
+                rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+            )
+            # Rank 0 is never the last rank in multi-rank mode (lm_head is None),
+            # so this is always a hidden state.
+            # Materialize the output and the whole cache in one scheduling
+            # pass — matches the single-rank prefill pattern and prevents
+            # stale/lazy cache tensors from corrupting later decode steps.
+            for i in range(len(cache.keys)):
+                cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+            hidden_or_logits = hidden_or_logits.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+
+        # Ship only the real (un-padded) prefill positions to downstream ranks.
+        # Slicing to [:, :prompt_tokens, :] strips the bucket-padding tokens so
+        # that each downstream rank's forward_pass populates exactly prompt_tokens
+        # KV-cache entries (positions 0..prompt_tokens-1), matching rank 0's cache.
+        # Sending only the last token would leave downstream KV caches with a
+        # single entry and produce garbage attention during decode.
+        prefill_hidden = hidden_or_logits[:, :prompt_tokens, :]
+        prefill_hidden = prefill_hidden.contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+
+        prefill_np = _tensor_to_np(prefill_hidden)
+        group.send_hidden(prefill_np)
+
+        # Wait for last rank to sample the first token.
+        token_id, stop = group.recv_token()
+
+        prefill_time = time.time() - prefill_start
+        prompt_tps = prompt_tokens / max(prefill_time, 1e-9)
+
+        position = prompt_tokens
+
+        # ── Decode loop ───────────────────────────────────────────────────────
+        generation_start = time.time()
+        for token_idx in range(max_tokens):
+            token_text: str = tokenizer.decode([token_id])  # pyright: ignore[reportAny]
+
+            is_eos = token_id in eos_ids
+            tokens_generated = token_idx + 1
+            elapsed = time.time() - generation_start
+            generation_tps = tokens_generated / max(elapsed, 1e-9)
+
+            finish_reason = None
+            stats = None
+            usage = None
+
+            if is_eos or stop:
+                finish_reason = "stop"
+            elif token_idx == max_tokens - 1:
+                finish_reason = "length"
+
+            if finish_reason is not None:
+                stats = GenerationStats(
+                    prompt_tps=prompt_tps, generation_tps=generation_tps,
+                    prompt_tokens=prompt_tokens,
+                    generation_tokens=tokens_generated,
+                    peak_memory_usage=Memory.from_bytes(0),
+                )
+                usage = Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=tokens_generated,
+                    total_tokens=prompt_tokens + tokens_generated,
+                    prompt_tokens_details=PromptTokensDetails(),
+                    completion_tokens_details=CompletionTokensDetails(),
+                )
+
+            if is_eos:
+                token_text = ""
+
+            # Logprobs are not available on rank 0 (no lm_head).
+            yield GenerationResponse(
+                text=token_text, token=token_id,
+                logprob=None, top_logprobs=None,
+                finish_reason=finish_reason, stats=stats, usage=usage,
+            )
+
+            if finish_reason is not None:
+                # Send stop to workers and end.
+                group.send_stop()
+                return
+
+            # ── Decode step: embed single token on rank 0, ship hidden ────
+            tok_tensor = Tensor([[token_id]], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            # CRITICAL: pass position_offset as a Tensor (not int) so
+            # grouped_query_attention takes the "decode" branch that attends
+            # against cache.keys/values — otherwise it attends only to the
+            # current single token's K/V and ignores all prefill context.
+            position_tensor = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            with Context(BEAM=0):
+                decode_hidden, _ = forward_pass(
+                    model, tok_tensor, cache,
+                    position_offset=position_tensor,
+                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                )
+                for i in range(len(cache.keys)):
+                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                decode_hidden = decode_hidden.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+
+            decode_np = _tensor_to_np(decode_hidden)
+            group.send_hidden(decode_np)
+
+            token_id, stop = group.recv_token()
+            position += 1
+
+    finally:
+        from exo.worker.engines.tinygrad.pipeline_group import TAG_STOP
+
+        # Ensure workers are unblocked even if the generator is closed early.
+        with contextlib.suppress(Exception):
+            group.send_stop()
+        # The STOP we just sent propagates through the ring and lands back in
+        # this rank's recv_sock (each worker forwards STOP before exiting, so
+        # in any ring size rank 0 receives exactly one STOP echo).  Drain it
+        # now so the next session starts with an empty recv buffer.
+        with contextlib.suppress(Exception):
+            while True:
+                tag, _payload = group.recv_any()
+                if tag == TAG_STOP:
+                    break
+
+
+def tinygrad_generate(
+    model: TransformerWeights,
+    tokenizer: Any,  # pyright: ignore[reportAny]
+    task: TextGenerationTaskParams,
+    prompt: str,
+    kv_prefix_cache: Any = None,  # pyright: ignore[reportAny]
+    on_prefill_progress: Callable[[int, int], None] | None = None,
+    group: "PipelineGroup | None" = None,
+) -> Generator[GenerationResponse]:
+    if group is None or group.world_size == 1:
+        yield from _single_rank_generate(model, tokenizer, task, prompt)
+        return
+
+    if group.rank == 0:
+        yield from _rank0_pipeline_generate(model, tokenizer, task, prompt, group)
+        return
+
+    # Non-rank-0 worker: run the blocking pipeline loop (no yields).
+    _worker_pipeline_loop(model, group, is_last=(group.rank == group.world_size - 1))
+    # Return without yielding — the caller's `for response in gen:` is a no-op.
+
+
+def warmup_inference(model: TransformerWeights, tokenizer: Any, group: "PipelineGroup | None" = None) -> int:  # pyright: ignore[reportAny]
     """Run a full generation loop to warm up forward pass, KV cache, and sampling."""
     from exo.shared.tokenizer.chat_template import apply_chat_template
     from exo.shared.types.common import ModelId as CommonModelId
@@ -284,12 +582,14 @@ def warmup_inference(model: TransformerWeights, tokenizer: Any, group: None = No
     prompt: str = apply_chat_template(tokenizer, warmup_task)
     tokens_generated = 0
 
-    for _ in tinygrad_generate(model, tokenizer, warmup_task, prompt):
+    for _ in tinygrad_generate(model, tokenizer, warmup_task, prompt, group=group):
         tokens_generated += 1
         if tokens_generated >= 5:
             break
 
-    _warmup_prefill_buckets(model)
+    # Only rank 0 owns embed_tokens, so only rank 0 benefits from prefill bucket warmup.
+    if group is None or group.rank == 0:
+        _warmup_prefill_buckets(model)
 
     return tokens_generated
 

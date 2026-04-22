@@ -194,10 +194,31 @@ def place_instance(
                 ephemeral_port=ephemeral_port,
             )
         case InstanceMeta.Tinygrad:
-            target_instances[instance_id] = TinygradInstance(
-                instance_id=instance_id,
-                shard_assignments=shard_assignments,
-            )
+            n_nodes = len(selected_cycle.node_ids)
+            if n_nodes == 1:
+                target_instances[instance_id] = TinygradInstance(
+                    instance_id=instance_id,
+                    shard_assignments=shard_assignments,
+                )
+            else:
+                if command.sharding != Sharding.Pipeline:
+                    raise ValueError(
+                        "multi-node Tinygrad requires Sharding.Pipeline "
+                        f"(got {command.sharding})"
+                    )
+                ephemeral_port = random_ephemeral_port()
+                hosts_by_node = get_mlx_ring_hosts_by_node(
+                    selected_cycle=selected_cycle,
+                    cycle_digraph=cycle_digraph,
+                    ephemeral_port=ephemeral_port,
+                    node_network=node_network,
+                )
+                target_instances[instance_id] = TinygradInstance(
+                    instance_id=instance_id,
+                    shard_assignments=shard_assignments,
+                    hosts_by_node=hosts_by_node,
+                    ephemeral_port=ephemeral_port,
+                )
 
     return target_instances
 

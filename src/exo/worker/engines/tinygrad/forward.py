@@ -20,16 +20,41 @@ class TransformerBlockBuilder(NamedTuple):
 
 def forward_pass(
     weights: TransformerWeights,
-    input_ids: Tensor,
+    input_or_hidden: Tensor,
     cache: KVCache | None,
     position_offset: int | Tensor = 0,
     rope_cos: Tensor | None = None,
     rope_sin: Tensor | None = None,
 ) -> tuple[Tensor, KVCache]:
-    config = weights.config
-    _batch, _seq_len = input_ids.shape
+    """Run a forward pass through this rank's portion of the transformer.
 
-    x = apply_embedding(weights.embed_tokens, input_ids)
+    ``input_or_hidden`` is interpreted based on whether ``weights.embed_tokens``
+    is present:
+
+    * **Rank 0 / single-rank** (``embed_tokens is not None``): ``input_or_hidden``
+      must be an int32 token-ID tensor of shape ``[batch, seq_len]``.  Embedding
+      is applied and the resulting hidden state is fed to the layer loop.
+
+    * **Middle / last pipeline rank** (``embed_tokens is None``): ``input_or_hidden``
+      must already be an embedded hidden-state tensor of shape
+      ``[batch, seq_len, hidden_dim]``.  The layer loop starts directly from it.
+
+    The return value similarly depends on the rank:
+
+    * **Last rank / single-rank** (``lm_head is not None``): returns logits of
+      shape ``[batch, seq_len, vocab_size]``.
+    * **Middle / first-only rank** (``lm_head is None``): returns the raw hidden
+      state of shape ``[batch, seq_len, hidden_dim]`` for the pipeline transport
+      to forward to the next rank.
+    """
+    config = weights.config
+
+    if weights.embed_tokens is not None:
+        # Rank 0 (or single-rank): run embedding on token IDs.
+        x = apply_embedding(weights.embed_tokens, input_or_hidden)
+    else:
+        # Middle/last pipeline rank: input is already an embedded hidden state.
+        x = input_or_hidden
 
     if cache is None:
         """
@@ -62,10 +87,17 @@ def forward_pass(
         if isinstance(position_offset, int):
             x = x.realize(cache.keys[layer_idx], cache.values[layer_idx])
 
-    x = rms_norm(x, weights.final_norm, config.rms_norm_eps)
-    logits = apply_lm_head(x, weights.lm_head)
+    if weights.final_norm is not None:
+        x = rms_norm(x, weights.final_norm, config.rms_norm_eps)
 
-    return logits, cache
+    if weights.lm_head is not None:
+        # Last rank (or single-rank): project to vocab space and return logits.
+        logits = apply_lm_head(x, weights.lm_head)
+        return logits, cache
+
+    # Middle pipeline rank: return hidden state instead of logits.
+    # Caller (pipeline transport) will ship this to the next rank.
+    return x, cache
 
 def _transformer_block(
     x: Tensor,

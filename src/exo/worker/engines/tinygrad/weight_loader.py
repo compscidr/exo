@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, NamedTuple, overload
 
@@ -39,9 +40,9 @@ class LayerWeights(NamedTuple):
     expert_down_projs: list[LinearWeight] | None = None
 
 class TransformerWeights(NamedTuple):
-    embed_tokens: EmbedWeight
-    lm_head: LinearWeight
-    final_norm: Tensor
+    embed_tokens: EmbedWeight | None
+    lm_head: LinearWeight | None
+    final_norm: Tensor | None
     layers: list[LayerWeights]
     config: ModelConfig
     rope_sin: Tensor
@@ -52,53 +53,112 @@ def load_transformer_weights(
     config: ModelConfig,
     start_layer: int = 0,
     end_layer: int | None = None,
+    is_first_rank: bool = True,
+    is_last_rank: bool = True,
 ) -> TransformerWeights:
 
     if end_layer is None:
         end_layer = config.num_hidden_layers
 
     spec = config.architecture_spec
-    raw_weights = _load_all_safetensors(model_path)
 
-    embed_tokens = _build_weight(raw_weights,
-        f"{spec.embed_key}.weight",
-        config, is_embedding = True)
+    # Build a key predicate so _load_all_safetensors only loads the weights
+    # this rank actually uses — critical for pipeline-parallel setups where
+    # a single GPU cannot hold the full model's safetensors on device.
+    # NB: append a trailing "." to each layer prefix so "model.layers.1."
+    # doesn't also match "model.layers.10.self_attn.q_proj.weight" etc.
+    layer_prefixes: list[str] = [
+        f"{spec.layer_prefix.format(layer_idx=i)}." for i in range(start_layer, end_layer)
+    ]
+    boundary_prefixes: list[str] = []
+    needs_embed = is_first_rank or (is_last_rank and config.tie_word_embeddings)
+    if needs_embed:
+        boundary_prefixes.append(f"{spec.embed_key}.")
+    if is_last_rank:
+        boundary_prefixes.append(f"{spec.final_norm_key}.")
+        if not config.tie_word_embeddings:
+            boundary_prefixes.append(f"{spec.lm_head_key}.")
 
-    lm_head: LinearWeight
-    if config.tie_word_embeddings:
-        if isinstance(embed_tokens, QuantizedEmbedding):
-            lm_head = QuantizedLinear(
-                weight_q = embed_tokens.weight_q,
-                scales = embed_tokens.scales,
-                biases = embed_tokens.biases,
-                group_size = embed_tokens.group_size,
-            )
-        else:
-            lm_head = embed_tokens
-    else:
-        lm_head = _build_weight(
-            raw_weights, f"{spec.lm_head_key}.weight", config,
+    def _keep_key(key: str) -> bool:
+        for p in layer_prefixes:
+            if key.startswith(p):
+                return True
+        for p in boundary_prefixes:
+            if key.startswith(p):
+                return True
+        return False
+
+    raw_weights = _load_all_safetensors(model_path, keep_predicate=_keep_key)
+
+    embed_tokens: EmbedWeight | None = None
+    lm_head: LinearWeight | None = None
+    final_norm: Tensor | None = None
+
+    # embed_tokens only needed on rank 0.
+    if is_first_rank:
+        embed_tokens = _build_weight(
+            raw_weights, f"{spec.embed_key}.weight", config, is_embedding=True
         )
 
-    final_norm = raw_weights[f"{spec.final_norm_key}.weight"]
+    # lm_head + final_norm only needed on the last rank.
+    if is_last_rank:
+        final_norm = raw_weights[f"{spec.final_norm_key}.weight"]
+
+        if config.tie_word_embeddings:
+            # lm_head shares weights with embed_tokens. If we already loaded
+            # embed_tokens above, reuse it; otherwise load the embed weight here
+            # purely to source lm_head.
+            source_embed: EmbedWeight
+            if embed_tokens is not None:
+                source_embed = embed_tokens
+            else:
+                source_embed = _build_weight(
+                    raw_weights, f"{spec.embed_key}.weight", config, is_embedding=True
+                )
+            if isinstance(source_embed, QuantizedEmbedding):
+                lm_head = QuantizedLinear(
+                    weight_q=source_embed.weight_q,
+                    scales=source_embed.scales,
+                    biases=source_embed.biases,
+                    group_size=source_embed.group_size,
+                )
+            else:
+                lm_head = source_embed
+        else:
+            lm_head = _build_weight(
+                raw_weights, f"{spec.lm_head_key}.weight", config,
+            )
 
     layers: list[LayerWeights] = []
 
     for layer_idx in range(start_layer, end_layer):
         prefix = spec.layer_prefix.format(layer_idx=layer_idx)
         layers.append(_build_layer_weights(raw_weights, prefix, spec, config))
+        # Drop this layer's raw keys once its merged weights are built.
+        # _build_layer_weights produces merged qkv_proj/gate_up_proj tensors
+        # that hold new storage; the originals in raw_weights (per-layer
+        # q/k/v/gate/up/down/o/norms) are no longer needed. Keeping them alive
+        # doubles peak VRAM on big pipelines — on a 14B/8bit model a beast
+        # rank loading ~10 GB of raw + ~5 GB of merged per-layer accumulators
+        # blows past 16 GB during the build loop.
+        stale_prefix = f"{prefix}."
+        for k in [kk for kk in raw_weights if kk.startswith(stale_prefix)]:
+            del raw_weights[k]
 
     rope_cos, rope_sin = compute_rope_frequencies(
-        head_dim = config.head_dim,
-        max_seq_len = config.max_position_embeddings,
-        rope_theta = config.rope_theta,
+        head_dim=config.head_dim,
+        max_seq_len=config.max_position_embeddings,
+        rope_theta=config.rope_theta,
     )
 
     return TransformerWeights(
-        embed_tokens=embed_tokens, lm_head=lm_head,
-        final_norm=final_norm, layers=layers, config=config,
-        rope_cos = rope_cos.realize(), 
-        rope_sin = rope_sin.realize(),
+        embed_tokens=embed_tokens,
+        lm_head=lm_head,
+        final_norm=final_norm,
+        layers=layers,
+        config=config,
+        rope_cos=rope_cos.realize(),
+        rope_sin=rope_sin.realize(),
     )
 
 def _merge_linear_weights(*weights: LinearWeight) -> LinearWeight:
@@ -250,20 +310,31 @@ def _build_weight(
 
     raise KeyError(f"Weight key '{key}' not found (also tried {qweight_key})")
 
-def _load_all_safetensors(path: Path) -> dict[str, Tensor]:
+def _load_all_safetensors(
+    path: Path,
+    keep_predicate: "Callable[[str], bool] | None" = None,
+) -> dict[str, Tensor]:
     from tinygrad.helpers import Context
 
     merged: dict[str, Tensor] = {}
+    any_file = False
 
     # Disable BEAM during weight loading. Copy kernels (DISK -> GPU) have unique
     # shapes per tensor and don't benefit from beam search optimisation.
+    # When `keep_predicate` is provided, only keys that pass the predicate are
+    # realized on the default device — everything else is skipped entirely,
+    # which is essential for pipeline-parallel setups where a single rank's
+    # GPU can't hold the full model (e.g. 32B-4bit at ~16GB on a 10–16GB card).
     with Context(BEAM=0):
         for safetensor_file in sorted(path.glob("*.safetensors")):
+            any_file = True
             shard = safe_load(str(safetensor_file))
             for key, tensor in shard.items():
+                if keep_predicate is not None and not keep_predicate(key):
+                    continue
                 merged[key] = tensor.to(Device.DEFAULT).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
 
-    if not merged:
+    if not any_file:
         raise FileNotFoundError(f"No .safetensors file found in {path}")
 
     return merged

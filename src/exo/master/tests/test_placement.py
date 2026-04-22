@@ -17,7 +17,11 @@ from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.events import InstanceCreated, InstanceDeleted
 from exo.shared.types.memory import Memory
 from exo.shared.types.multiaddr import Multiaddr
-from exo.shared.types.profiling import NetworkInterfaceInfo, NodeNetworkInfo
+from exo.shared.types.profiling import (
+    MemoryUsage,
+    NetworkInterfaceInfo,
+    NodeNetworkInfo,
+)
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.instances import (
     Instance,
@@ -479,3 +483,77 @@ def test_place_tinygrad_single_node(model_card: ModelCard):
     assert len(placements) == 1
     instance = list(placements.values())[0]
     assert isinstance(instance, TinygradInstance)
+
+
+def _make_two_node_tinygrad_topology(
+    model_card: ModelCard,
+) -> tuple[
+    Topology,
+    dict[NodeId, MemoryUsage],
+    dict[NodeId, NodeNetworkInfo],
+    NodeId,
+    NodeId,
+]:
+    """Helper: two fully-connected nodes with enough memory for model_card."""
+    topology = Topology()
+    node_id_a = NodeId()
+    node_id_b = NodeId()
+    topology.add_node(node_id_a)
+    topology.add_node(node_id_b)
+    topology.add_connection(
+        Connection(source=node_id_a, sink=node_id_b, edge=create_socket_connection(1))
+    )
+    topology.add_connection(
+        Connection(source=node_id_b, sink=node_id_a, edge=create_socket_connection(2))
+    )
+    node_memory: dict[NodeId, MemoryUsage] = {
+        node_id_a: create_node_memory(model_card.storage_size.in_bytes),
+        node_id_b: create_node_memory(model_card.storage_size.in_bytes),
+    }
+    node_network: dict[NodeId, NodeNetworkInfo] = {
+        node_id_a: create_node_network(),
+        node_id_b: create_node_network(),
+    }
+    return topology, node_memory, node_network, node_id_a, node_id_b
+
+
+def test_tinygrad_multinode_requires_pipeline(model_card: ModelCard):
+    """Multi-node Tinygrad placement with Tensor sharding must raise ValueError."""
+    topology, node_memory, node_network, _node_id_a, _node_id_b = (
+        _make_two_node_tinygrad_topology(model_card)
+    )
+
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card,
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.Tinygrad,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="multi-node Tinygrad requires Sharding.Pipeline"):
+        place_instance(command, topology, {}, node_memory, node_network)
+
+
+def test_tinygrad_multinode_pipeline_populates_hosts(model_card: ModelCard):
+    """Multi-node Tinygrad placement with Pipeline sharding populates hosts_by_node and ephemeral_port."""
+    topology, node_memory, node_network, _node_id_a, _node_id_b = (
+        _make_two_node_tinygrad_topology(model_card)
+    )
+
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card,
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.Tinygrad,
+        min_nodes=2,
+    )
+
+    placements = place_instance(command, topology, {}, node_memory, node_network)
+
+    assert len(placements) == 1
+    instance = list(placements.values())[0]
+    assert isinstance(instance, TinygradInstance)
+    assert instance.hosts_by_node is not None
+    assert len(instance.hosts_by_node) == 2
+    assert instance.ephemeral_port is not None

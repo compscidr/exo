@@ -10,6 +10,7 @@ from exo.shared.types.chunks import (
     TokenChunk,
     ToolCallChunk,
 )
+from exo.shared.types.common import NodeId
 from exo.shared.types.events import (
     ChunkGenerated,
     Event,
@@ -18,6 +19,7 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.tasks import (
+    ConnectToGroup,
     LoadModel,
     Shutdown,
     StartWarmup,
@@ -27,12 +29,14 @@ from exo.shared.types.tasks import (
     TextGeneration,
 )
 from exo.shared.types.text_generation import TextGenerationTaskParams
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, TinygradInstance
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
     ToolCallResponse,
 )
 from exo.shared.types.worker.runners import (
+    RunnerConnected,
+    RunnerConnecting,
     RunnerFailed,
     RunnerIdle,
     RunnerLoaded,
@@ -50,6 +54,7 @@ from exo.worker.engines.tinygrad.generator.generate import (
     tinygrad_generate,
     warmup_inference,
 )
+from exo.worker.engines.tinygrad.pipeline_group import PipelineGroup
 from exo.worker.engines.tinygrad.utils_tinygrad import (
     initialize_tinygrad,
     load_tinygrad_items,
@@ -71,6 +76,7 @@ def main(
 
     runner_id = bound_instance.bound_runner_id
     shard_metadata = bound_instance.bound_shard
+    group: PipelineGroup | None = None
 
     logger.info("hello from the tinygrad runner")
 
@@ -98,7 +104,49 @@ def main(
                 TaskStatusUpdated(task_id=task.task_id, task_status=TaskStatus.Running)
             )
             match task:
-                case LoadModel() if isinstance(current_status, (RunnerIdle, RunnerFailed)):
+                case ConnectToGroup() if isinstance(current_status, (RunnerIdle, RunnerFailed)):
+                    instance = bound_instance.instance
+                    assert isinstance(instance, TinygradInstance), (
+                        "ConnectToGroup received on non-TinygradInstance in tinygrad runner"
+                    )
+                    assert instance.hosts_by_node is not None, (
+                        "ConnectToGroup received but TinygradInstance has no hosts_by_node"
+                    )
+                    assert instance.ephemeral_port is not None
+
+                    logger.info("tinygrad runner connecting to pipeline group")
+                    current_status = RunnerConnecting()
+                    event_sender.send(
+                        RunnerStatusUpdated(
+                            runner_id=runner_id, runner_status=current_status
+                        )
+                    )
+                    event_sender.send(TaskAcknowledged(task_id=task.task_id))
+
+                    # Build rank -> node mapping from shard_assignments.
+                    shard_assignments = instance.shard_assignments
+                    node_rank_mapping: list[NodeId | None] = [None] * shard_metadata.world_size
+                    for node_id, other_runner_id in shard_assignments.node_to_runner.items():
+                        other_shard = shard_assignments.runner_to_shard[other_runner_id]
+                        node_rank_mapping[other_shard.device_rank] = node_id
+                    assert all(n is not None for n in node_rank_mapping), (
+                        f"node_rank_mapping has unfilled slots: {node_rank_mapping}"
+                    )
+                    resolved_mapping: list[NodeId] = [n for n in node_rank_mapping if n is not None]
+
+                    group = PipelineGroup.connect(
+                        rank=shard_metadata.device_rank,
+                        world_size=shard_metadata.world_size,
+                        hosts_by_node=instance.hosts_by_node,
+                        bind_port=instance.ephemeral_port,
+                        node_rank_mapping=resolved_mapping,
+                    )
+                    logger.info(
+                        f"tinygrad pipeline group connected at rank {group.rank} of {group.world_size}"
+                    )
+                    current_status = RunnerConnected()
+
+                case LoadModel() if isinstance(current_status, (RunnerIdle, RunnerConnected, RunnerFailed)):
                     total_layers = shard_metadata.end_layer - shard_metadata.start_layer
                     current_status = RunnerLoading(
                         layers_loaded=0, total_layers=total_layers
@@ -126,11 +174,11 @@ def main(
                         ModelTask.TextGeneration in shard_metadata.model_card.tasks
                     ), f"Incorrect model task(s): {shard_metadata.model_card.tasks}"
 
-                    initialize_tinygrad(bound_instance)
+                    initialize_tinygrad(bound_instance, group=group)
 
                     inference_model, tokenizer = load_tinygrad_items(  # pyright: ignore[reportAny]
                         bound_instance,
-                        None,
+                        group,
                         on_timeout=on_model_load_timeout,
                     )
                     logger.info(
@@ -165,6 +213,7 @@ def main(
                     toks = warmup_inference(
                         model=inference_model,
                         tokenizer=tokenizer,
+                        group=group,
                     )
                     logger.info(f"warmed up by generating {toks} tokens")
                     check_for_cancel_every = min(
@@ -205,6 +254,7 @@ def main(
                             tokenizer=tokenizer,
                             task=task_params,
                             prompt=prompt,
+                            group=group,
                         )
 
                         if tool_parser:
@@ -290,6 +340,9 @@ def main(
                 case Shutdown():
                     current_status = RunnerShuttingDown()
                     logger.info("tinygrad runner shutting down")
+                    if group is not None:
+                        group.close()
+                        group = None
                     if not TYPE_CHECKING:
                         del inference_model, tokenizer
                         cleanup_jit_state()
