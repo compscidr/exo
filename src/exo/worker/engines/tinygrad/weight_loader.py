@@ -145,6 +145,12 @@ def load_transformer_weights(
         for k in [kk for kk in raw_weights if kk.startswith(stale_prefix)]:
             del raw_weights[k]
 
+    # Boundary tensors (embed_tokens, lm_head, final_norm) were already
+    # extracted above and are held by their local vars. Drop the dict's
+    # refs to free VRAM occupied by the raw safetensor entries once the
+    # layer loop's per-iter dels have emptied everything else.
+    raw_weights.clear()
+
     rope_cos, rope_sin = compute_rope_frequencies(
         head_dim=config.head_dim,
         max_seq_len=config.max_position_embeddings,
