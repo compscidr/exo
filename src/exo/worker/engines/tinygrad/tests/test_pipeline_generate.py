@@ -129,7 +129,7 @@ class _FakeGroup(PipelineGroup):
     inbound_queue: list[tuple[int, bytes]]
 
     # Records of what the SUT sent to the "next" rank.
-    sent_hiddens: list[np.ndarray[Any, np.dtype[np.float32]]]
+    sent_hiddens: list[np.ndarray[Any, np.dtype[np.uint16]]]
     sent_tokens: list[tuple[int, bool]]
     sent_stops: int
 
@@ -149,10 +149,10 @@ class _FakeGroup(PipelineGroup):
 
     # ── Overridden transport methods ─────────────────────────────────────
 
-    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.float32]]) -> None:
+    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
         self.sent_hiddens.append(arr)
 
-    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.float32]]:
+    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
         tag, payload = self.recv_any()
         if tag != TAG_HIDDEN:
             raise RuntimeError(f"expected HIDDEN, got tag={tag}")
@@ -181,7 +181,7 @@ class _FakeGroup(PipelineGroup):
 
     # ── Helper to pre-load inbound messages ──────────────────────────────
 
-    def queue_hidden(self, arr: np.ndarray[Any, np.dtype[np.float32]]) -> None:
+    def queue_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
         self.inbound_queue.append((TAG_HIDDEN, encode_hidden(arr)))
 
     def queue_stop(self) -> None:
@@ -288,7 +288,7 @@ def test_pipeline_rank0_sends_hidden_recvs_token(tmp_path: Path) -> None:
     # All send_hidden calls must pass a 3-D fp16 ndarray.
     for arr in group.sent_hiddens:
         arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
-        assert arr.dtype == np.float32, f"expected fp32, got {arr.dtype}"
+        assert arr.dtype == np.uint16, f"expected uint16, got {arr.dtype}"
         assert len(arr_shape) == 3, f"expected 3-D hidden, got {len(arr_shape)}-D"
 
     # Must have yielded GenerationResponse objects.
@@ -345,7 +345,7 @@ def test_worker_loop_processes_hidden_and_sends(tmp_path: Path) -> None:
 
     group = _fake_group(rank=1, world_size=3)
     # Queue a fake hidden then a stop.
-    arr_in = np.zeros((1, 1, _HIDDEN), dtype=np.float32)
+    arr_in = np.zeros((1, 1, _HIDDEN), dtype=np.uint16)
     group.queue_hidden(arr_in)
     group.queue_stop()
 
@@ -355,7 +355,7 @@ def test_worker_loop_processes_hidden_and_sends(tmp_path: Path) -> None:
     assert len(group.sent_hiddens) == 1
     sent = group.sent_hiddens[0]
     sent_shape: tuple[int, ...] = sent.shape  # pyright: ignore[reportAny]
-    assert sent.dtype == np.float32
+    assert sent.dtype == np.uint16
     assert len(sent_shape) == 3
 
     # STOP must have been propagated.
@@ -380,7 +380,7 @@ def test_last_rank_samples_and_sends_token(tmp_path: Path) -> None:
     assert weights.lm_head is not None
 
     group = _fake_group(rank=1, world_size=2)
-    arr_in = np.zeros((1, 1, _HIDDEN), dtype=np.float32)
+    arr_in = np.zeros((1, 1, _HIDDEN), dtype=np.uint16)
     group.queue_hidden(arr_in)
     group.queue_stop()
 
@@ -440,7 +440,7 @@ def test_pipeline_rank0_prefill_unpadded(tmp_path: Path) -> None:
     )
     assert prefill_shape[0] == 1, f"expected batch=1, got {prefill_shape[0]}"
     assert prefill_shape[2] == _HIDDEN, f"expected hidden_dim={_HIDDEN}, got {prefill_shape[2]}"
-    assert prefill_hidden.dtype == np.float32, f"expected fp32, got {prefill_hidden.dtype}"
+    assert prefill_hidden.dtype == np.uint16, f"expected uint16, got {prefill_hidden.dtype}"
 
 
 def test_worker_rank_generate_yields_nothing(tmp_path: Path) -> None:

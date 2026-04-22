@@ -27,11 +27,13 @@ _HIDDEN_SHAPE = struct.Struct("<HIH")  # batch u16, seq_len u32, hidden_dim u16
 _TOKEN_PAYLOAD = struct.Struct("<iB")  # token_id i32-le, stop u8
 
 
-def encode_hidden(arr: np.ndarray[Any, np.dtype[np.float32]]) -> bytes:
-    # Wire format: fp32. Residual-stream activations can exceed fp16 range
-    # mid-network on larger models, so we pay 2× bandwidth for precision /
-    # range fidelity. Callers cast from the native tensor dtype to fp32.
-    assert arr.dtype == np.float32 and arr.ndim == 3
+def encode_hidden(arr: np.ndarray[Any, np.dtype[np.uint16]]) -> bytes:
+    # Wire format: bf16 bytes, carried as uint16 since numpy has no native
+    # bf16 dtype. bf16 has fp32's exponent range (no saturation on residual
+    # streams that exceed ~65504) while using half the bandwidth of fp32.
+    # Callers should cast their Tensor to bfloat16 and bitcast to uint16
+    # before passing the resulting ndarray in.
+    assert arr.dtype == np.uint16 and arr.ndim == 3
     batch = cast(int, arr.shape[0])
     seq_len = cast(int, arr.shape[1])
     hidden_dim = cast(int, arr.shape[2])
@@ -40,24 +42,26 @@ def encode_hidden(arr: np.ndarray[Any, np.dtype[np.float32]]) -> bytes:
     return shape_hdr + arr.tobytes()
 
 
-def decode_hidden(buf: bytes) -> np.ndarray[Any, np.dtype[np.float32]]:  # noqa: D401
+def decode_hidden(buf: bytes) -> np.ndarray[Any, np.dtype[np.uint16]]:  # noqa: D401
     """Decode a HIDDEN-frame payload.
 
-    Returns a *writable* fp32 ndarray. `np.frombuffer` on `bytes` produces a
-    read-only array, which tinygrad's CUDA copyin rejects with
-    ``TypeError: underlying buffer is not writable``; we copy once here
-    so callers can pass the result straight into ``Tensor(arr)``.
+    Returns a *writable* uint16 ndarray carrying bf16 bit patterns.
+    `np.frombuffer` on `bytes` produces a read-only array, which
+    tinygrad's CUDA copyin rejects with
+    ``TypeError: underlying buffer is not writable``; we copy once
+    here so callers can pass the result straight into
+    ``Tensor(arr).bitcast(dtypes.bfloat16)``.
     """
     raw = _HIDDEN_SHAPE.unpack_from(buf, 0)
     batch = cast(int, raw[0])
     seq_len = cast(int, raw[1])
     hidden_dim = cast(int, raw[2])
-    expected_bytes = batch * seq_len * hidden_dim * 4  # fp32 = 4 bytes per element
+    expected_bytes = batch * seq_len * hidden_dim * 2  # bf16 = 2 bytes per element
     actual_bytes = len(buf) - _HIDDEN_SHAPE.size
     assert actual_bytes == expected_bytes, (
         f"decode_hidden: wire corruption — expected {expected_bytes} data bytes, got {actual_bytes}"
     )
-    data = np.frombuffer(buf[_HIDDEN_SHAPE.size :], dtype=np.float32)
+    data = np.frombuffer(buf[_HIDDEN_SHAPE.size :], dtype=np.uint16)
     return data.reshape(batch, seq_len, hidden_dim).copy()
 
 
@@ -204,10 +208,10 @@ class PipelineGroup:
             send_sock=send_sock,
         )
 
-    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.float32]]) -> None:
+    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
         _send_frame(self.send_sock, TAG_HIDDEN, encode_hidden(arr))
 
-    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.float32]]:
+    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
         tag, payload = _recv_frame(self.recv_sock)
         if tag != TAG_HIDDEN:
             raise RuntimeError(f"expected HIDDEN, got tag={tag}")

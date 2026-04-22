@@ -100,16 +100,17 @@ def _build_jit_decode(
     return decode
 
 
-def _tensor_to_np(t: Tensor) -> "np.ndarray[Any, np.dtype[np.float32]]":
-    """Convert a tinygrad Tensor to a writable fp32 numpy ndarray for the pipeline transport.
+def _tensor_to_np(t: Tensor) -> "np.ndarray[Any, np.dtype[np.uint16]]":
+    """Convert a tinygrad Tensor to a writable uint16-packed bf16 ndarray.
 
-    `.cast(float32)` runs on the device *before* `.numpy()` so the conversion
-    is a proper dtype cast — not a host-side reinterpret of the storage bytes
-    (which would happen if `.numpy()` was called on a bf16 tensor, since
-    numpy has no native bf16 and tinygrad may expose bf16 storage as uint16).
+    Sequence on the device: ``.cast(bfloat16)`` does a proper dtype
+    conversion, then ``.bitcast(uint16)`` reinterprets the bit pattern
+    without a value conversion so we can hand numpy — which has no
+    native bf16 — a dtype it understands. The receiving rank does the
+    reverse bitcast back to bf16 and then casts to the activation dtype.
     """
-    raw: Any = t.cast(dtypes.float32).numpy()
-    result: np.ndarray[Any, np.dtype[np.float32]] = raw  # pyright: ignore[reportAny]
+    raw: Any = t.cast(dtypes.bfloat16).bitcast(dtypes.uint16).numpy()
+    result: np.ndarray[Any, np.dtype[np.uint16]] = raw  # pyright: ignore[reportAny]
     return result
 
 
@@ -333,11 +334,13 @@ def _worker_pipeline_loop(
             arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
             seq_len = int(arr_shape[1])
 
-            # The wire format is fp32 for precision fidelity, but the model's
-            # internal activation dtype is typically fp16 (matching rope_cos).
-            # Cast to match so forward_pass's matmuls don't hit dtype mismatch.
+            # The wire format is bf16 packed as uint16 (numpy has no bf16).
+            # Reinterpret the bit pattern as bf16, then cast to the model's
+            # internal activation dtype (matches rope_cos) so forward_pass's
+            # matmuls don't hit a dtype mismatch.
             hidden = (
                 Tensor(arr)
+                .bitcast(dtypes.bfloat16)
                 .cast(model.rope_cos.dtype)  # pyright: ignore[reportUnknownMemberType]
                 .contiguous()
                 .realize()
