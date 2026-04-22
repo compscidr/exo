@@ -47,7 +47,7 @@ def parse_model_config(config_path: Path) -> ModelConfig:  # noqa: C901
     rms_norm_eps: float = raw.get("rms_norm_eps", 1e-6)  # pyright: ignore[reportAny]
     tie_word_embeddings: bool = raw.get("tie_word_embeddings", False)  # pyright: ignore[reportAny]
 
-    quant_raw: dict[str, Any] | None = raw.get("quantization_config")
+    quant_raw: dict[str, Any] | None = raw.get("quantization_config") or raw.get("quantization")
     quantization_config: QuantizationConfig | None = None
 
     if quant_raw and "bits" in quant_raw and "group_size" in quant_raw:
