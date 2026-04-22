@@ -5,6 +5,7 @@ from typing import Sequence
 
 from exo.master.placement_utils import (
     Cycle,
+    auto_per_rank_reserved_memory,
     filter_cycles_by_memory,
     get_mlx_jaccl_coordinators,
     get_mlx_jaccl_devices_matrix,
@@ -79,8 +80,22 @@ def place_instance(
             for cycle in candidate_cycles
             if required_nodes.issubset(cycle.node_ids)
         ]
+    # Reserve per-node VRAM for CUDA context + KV cache + scratch so
+    # placement doesn't schedule a model that fills the GPU with weights
+    # and leaves nothing for inference. Estimate is derived from the
+    # model card — no manual tuning required when switching models.
+    per_rank_reserved = auto_per_rank_reserved_memory(
+        model_card_hidden_size=command.model_card.hidden_size,
+        model_card_n_layers=command.model_card.n_layers,
+        world_size=max(
+            (len(cycle.node_ids) for cycle in candidate_cycles), default=1
+        ),
+    )
     cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, node_memory, command.model_card.storage_size
+        candidate_cycles,
+        node_memory,
+        command.model_card.storage_size,
+        per_rank_reserved_memory=per_rank_reserved,
     )
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")

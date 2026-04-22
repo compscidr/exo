@@ -17,22 +17,101 @@ from exo.shared.types.worker.shards import (
     TensorShardMetadata,
 )
 
+# Per-rank VRAM overhead that placement should *not* assume is available for
+# model weights. Covers:
+#  * CUDA/NV context + driver working set: ~1–1.5 GB depending on arch.
+#  * Scratch buffers tinygrad allocates during kernel launches.
+# KV cache is charged separately below because it scales with model size.
+_PER_RANK_FIXED_OVERHEAD_MB: int = 1500
+
+# Max sequence length the KVCache allocates in the tinygrad engine —
+# see exo.worker.engines.tinygrad.generator.generate:_make_kv_cache and
+# forward.py (clamps max_position_embeddings at 4096 for consumer GPUs).
+_KV_CACHE_MAX_SEQ_LEN: int = 4096
+
+
+def auto_per_rank_reserved_memory(
+    *,
+    model_card_hidden_size: int,
+    model_card_n_layers: int,
+    world_size: int,
+) -> Memory:
+    """Estimate per-rank VRAM that must be reserved for non-weights state.
+
+    The returned value is conservative — it over-estimates the KV cache
+    by assuming MHA (one KV head per attention head). Real GQA models
+    use fewer KV heads so their actual footprint is smaller, but wasting
+    a few hundred MB of headroom is cheaper than an OOM crash during load.
+
+    The estimate uses only fields available on ``ModelCard`` so nothing
+    here needs to read ``config.json`` at placement time.
+    """
+    # KV cache across the whole model: hidden_size × 2 (K+V) × max_seq_len
+    # × 2 (bf16) × n_layers. Split evenly by rank for the estimate; actual
+    # layer-per-rank split is close to proportional so this averages out.
+    kv_total_bytes = (
+        model_card_hidden_size
+        * 2
+        * _KV_CACHE_MAX_SEQ_LEN
+        * 2
+        * max(model_card_n_layers, 1)
+    )
+    kv_per_rank_bytes = kv_total_bytes // max(world_size, 1)
+    fixed_bytes = _PER_RANK_FIXED_OVERHEAD_MB * 1024 * 1024
+    return Memory.from_bytes(fixed_bytes + kv_per_rank_bytes)
+
+
+# Safety cap: per-node reserved memory is clamped to at most this fraction
+# of the node's ram_available. Prevents the reserve from dominating on
+# tiny/test nodes where auto-estimated overhead would exceed available VRAM.
+_MAX_RESERVED_FRACTION: float = 0.3
+
+# Below this per-node ram_available, skip the reserve entirely. Real GPUs
+# have many GB of VRAM; anything under 1 GB is a test fixture or degenerate
+# case where the reserve's semantics (CUDA context, KV cache, scratch)
+# don't make sense.
+_MIN_RESERVE_APPLY_BYTES: int = 1024 * 1024 * 1024
+
 
 def filter_cycles_by_memory(
     cycles: list[Cycle],
     node_memory: Mapping[NodeId, MemoryUsage],
     required_memory: Memory,
+    per_rank_reserved_memory: Memory | None = None,
 ) -> list[Cycle]:
+    """Filter cycles whose aggregate free VRAM can hold ``required_memory``.
+
+    When ``per_rank_reserved_memory`` is supplied, each node's contribution
+    to the aggregate is reduced by that amount — models CUDA context + KV
+    cache + activation scratch that can't be used for model weights. The
+    subtracted amount is capped at ``_MAX_RESERVED_FRACTION`` of the node's
+    own ram_available so the reserve never dominates a small node.
+    """
     filtered_cycles: list[Cycle] = []
     for cycle in cycles:
         if not all(node in node_memory for node in cycle):
             continue
 
-        total_mem = sum(
-            (node_memory[node_id].ram_available for node_id in cycle.node_ids),
-            start=Memory(),
+        desired_reserve_bytes = (
+            per_rank_reserved_memory.in_bytes
+            if per_rank_reserved_memory is not None
+            else 0
         )
-        if total_mem >= required_memory:
+
+        total_bytes = 0
+        for node_id in cycle.node_ids:
+            available = node_memory[node_id].ram_available.in_bytes
+            if available < _MIN_RESERVE_APPLY_BYTES:
+                # Degenerate/test fixture; reserve semantics don't apply.
+                reserve = 0
+            else:
+                reserve = min(
+                    desired_reserve_bytes, int(available * _MAX_RESERVED_FRACTION)
+                )
+            effective = available - reserve
+            if effective > 0:
+                total_bytes += effective
+        if total_bytes >= required_memory.in_bytes:
             filtered_cycles.append(cycle)
     return filtered_cycles
 
