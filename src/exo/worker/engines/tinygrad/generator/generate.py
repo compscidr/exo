@@ -354,7 +354,13 @@ def _worker_pipeline_loop(
             else:
                 position_offset = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
 
-            with Context(BEAM=0):
+            # Prefill shapes vary per prompt length and aren't cacheable,
+            # so disable BEAM. Decode shape is fixed (seq_len=1) so let
+            # BEAM search kernels like the runner bootstrap defaults to.
+            fwd_context: "contextlib.AbstractContextManager[object]" = (
+                Context(BEAM=0) if first else contextlib.nullcontext()
+            )
+            with fwd_context:
                 output, _ = forward_pass(
                     model, hidden, cache,
                     position_offset=position_offset,
@@ -512,16 +518,18 @@ def _rank0_pipeline_generate(
             # against cache.keys/values — otherwise it attends only to the
             # current single token's K/V and ignores all prefill context.
             position_tensor = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-            with Context(BEAM=0):
-                decode_hidden, _ = forward_pass(
-                    model, tok_tensor, cache,
-                    position_offset=position_tensor,
-                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
-                )
-                for i in range(len(cache.keys)):
-                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                decode_hidden = decode_hidden.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+            # Decode shape is fixed (seq_len=1), so BEAM can cache kernels;
+            # let the runner-bootstrap default (BEAM=2) apply instead of
+            # disabling BEAM as we used to.
+            decode_hidden, _ = forward_pass(
+                model, tok_tensor, cache,
+                position_offset=position_tensor,
+                rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+            )
+            for i in range(len(cache.keys)):
+                cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+            decode_hidden = decode_hidden.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
 
             decode_np = _tensor_to_np(decode_hidden)
             group.send_hidden(decode_np)
