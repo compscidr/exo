@@ -33,6 +33,11 @@ class LayerWeights(NamedTuple):
     q_norm: Tensor | None = None
     k_norm: Tensor | None = None
 
+    # Attention biases (Qwen2 has biased Q/K/V; most Llama/Qwen3 do not).
+    # qkv_bias is the concat of q,k,v biases matching qkv_proj's output dim.
+    qkv_bias: Tensor | None = None
+    o_bias: Tensor | None = None
+
     # MoE (None for dense models)
     router_weight: Tensor | None = None
     expert_gate_projs: list[LinearWeight] | None = None
@@ -80,13 +85,9 @@ def load_transformer_weights(
             boundary_prefixes.append(f"{spec.lm_head_key}.")
 
     def _keep_key(key: str) -> bool:
-        for p in layer_prefixes:
-            if key.startswith(p):
-                return True
-        for p in boundary_prefixes:
-            if key.startswith(p):
-                return True
-        return False
+        if any(key.startswith(p) for p in layer_prefixes):
+            return True
+        return any(key.startswith(p) for p in boundary_prefixes)
 
     raw_weights = _load_all_safetensors(model_path, keep_predicate=_keep_key)
 
@@ -225,6 +226,19 @@ def _build_layer_weights(
     v_proj = _build_weight(raw, key(spec.v_proj_key), config)
     qkv_proj = _merge_linear_weights(q_proj, k_proj, v_proj)
 
+    # Optional attention biases. Qwen2 has them; Llama doesn't. If any
+    # one of the three q/k/v biases is present the rest are too (the
+    # model is either attention_bias=True or False uniformly), so we
+    # check q as the probe and concat all three.
+    q_bias_key = f"{prefix}.{spec.q_proj_key}.bias"
+    qkv_bias: Tensor | None = None
+    if q_bias_key in raw:
+        q_bias = raw[q_bias_key]
+        k_bias = raw[f"{prefix}.{spec.k_proj_key}.bias"]
+        v_bias = raw[f"{prefix}.{spec.v_proj_key}.bias"]
+        qkv_bias = q_bias.cat(k_bias, v_bias, dim=0).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+    o_bias = raw.get(f"{prefix}.{spec.o_proj_key}.bias")
+
     gate_proj = _build_weight(raw, key(spec.gate_proj_key), config)
     up_proj = _build_weight(raw, key(spec.up_proj_key), config)
     gate_up_proj = _merge_linear_weights(gate_proj, up_proj)
@@ -238,6 +252,8 @@ def _build_layer_weights(
         post_attn_norm=raw[f"{prefix}.{spec.post_attn_norm_key}.weight"],
         q_norm=q_norm,
         k_norm=k_norm,
+        qkv_bias=qkv_bias,
+        o_bias=o_bias,
     )
 
 @overload

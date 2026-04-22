@@ -124,6 +124,8 @@ def _transformer_block(
                 head_dim = config.head_dim,
                 q_norm = layer.q_norm,
                 k_norm = layer.k_norm,
+                qkv_bias = layer.qkv_bias,
+                o_bias = layer.o_bias,
                 rms_norm_eps = config.rms_norm_eps,
             )
         case "multi_latent":

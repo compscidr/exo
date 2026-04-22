@@ -31,6 +31,8 @@ def grouped_query_attention(
     head_dim: int,
     q_norm: Tensor | None = None,
     k_norm: Tensor | None = None,
+    qkv_bias: Tensor | None = None,
+    o_bias: Tensor | None = None,
     rms_norm_eps: float = 1e-6,
 ) -> Tensor:
     _batch, seq_len, _ = x.shape
@@ -38,6 +40,10 @@ def grouped_query_attention(
     q_dim = num_heads * head_dim
     kv_dim = num_kv_heads * head_dim
     qkv = linear_forward(x, qkv_proj)
+    # Qwen2 (and some other architectures) have biased Q/K/V projections.
+    # Llama has none, so qkv_bias is None and this branch is skipped.
+    if qkv_bias is not None:
+        qkv = qkv + qkv_bias
     q = qkv[..., :q_dim].reshape(int(_batch), seq_len, num_heads, head_dim).permute(0, 2, 1, 3)  # pyright: ignore[reportUnknownMemberType]
     k = qkv[..., q_dim:q_dim + kv_dim].reshape(int(_batch), seq_len, num_kv_heads, head_dim).permute(0, 2, 1, 3)  # pyright: ignore[reportUnknownMemberType]
     v = qkv[..., q_dim + kv_dim:].reshape(int(_batch), seq_len, num_kv_heads, head_dim).permute(0, 2, 1, 3)  # pyright: ignore[reportUnknownMemberType]
@@ -93,4 +99,7 @@ def grouped_query_attention(
     out: Tensor = attn_weights @ v_attn  # pyright: ignore[reportUnknownVariableType]
     out = out.permute(0, 2, 1, 3).reshape(int(_batch), seq_len, num_heads * head_dim)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
 
-    return linear_forward(out, o_proj)  # pyright: ignore[reportUnknownArgumentType]
+    out_projected = linear_forward(out, o_proj)  # pyright: ignore[reportUnknownArgumentType]
+    if o_bias is not None:
+        out_projected = out_projected + o_bias
+    return out_projected
