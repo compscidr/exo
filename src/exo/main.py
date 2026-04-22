@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import resource
 import signal
+import sys
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -252,7 +253,11 @@ def main():
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
-    mp.set_start_method("fork")
+    # Only Linux/Nvidia needs fork — spawn-mode runner subprocesses there
+    # fail to import torch because they don't inherit LD_LIBRARY_PATH. On
+    # macOS/Windows fork is unsafe (no os.fork on Windows; macOS Objective-C
+    # runtime state doesn't survive fork), so keep spawn there.
+    mp.set_start_method("fork" if sys.platform == "linux" else "spawn")
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
     logger.info("Starting EXO")
