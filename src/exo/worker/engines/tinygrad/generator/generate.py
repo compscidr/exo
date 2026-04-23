@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-from loguru import logger
 
 if TYPE_CHECKING:
     from exo.worker.engines.tinygrad.pipeline_group import PipelineGroup
@@ -220,10 +219,11 @@ def _decide_prefill_strategy(
         and delta <= int(prompt_tokens * _MAX_INCREMENTAL_FRACTION)
     )
 
-    logger.info(
+    print(
         f"[prefix-cache decision] state_tokens={len(state.tokens)} "
         f"new_prompt_tokens={prompt_tokens} common_len={common_len} "
-        f"delta={delta} use_incremental={use_incremental}"
+        f"delta={delta} use_incremental={use_incremental}",
+        flush=True,
     )
     if common_len < _MIN_REUSABLE_PREFIX and len(state.tokens) >= _MIN_REUSABLE_PREFIX:
         # Unexpected low overlap — dump prefixes so we can see where they
@@ -232,11 +232,12 @@ def _decide_prefill_strategy(
         divergence = common_len
         stored_window = state.tokens[max(0, divergence - 4): divergence + 12]
         incoming_window = input_ids[max(0, divergence - 4): divergence + 12]
-        logger.warning(
+        print(
             f"[prefix-cache low-overlap] diverge@{divergence} "
             f"stored_head={state.tokens[:20]} "
             f"incoming_head={input_ids[:20]} "
-            f"stored_window={stored_window} incoming_window={incoming_window}"
+            f"stored_window={stored_window} incoming_window={incoming_window}",
+            flush=True,
         )
 
     if use_incremental:
@@ -621,9 +622,10 @@ def _rank0_pipeline_generate(
     try:
         branch_start = time.time()
         if strategy == "full" or prior_state is None:
-            logger.info(
+            print(
                 f"[prefill-branch] running FULL prefill "
-                f"(prompt_tokens={prompt_tokens}, prior_state={prior_state is not None})"
+                f"(prompt_tokens={prompt_tokens}, prior_state={prior_state is not None})",
+                flush=True,
             )
             # ── Full prefill from scratch ─────────────────────────────────────
             # Discard any prior cache, allocate fresh, run the complete batched
@@ -670,8 +672,9 @@ def _rank0_pipeline_generate(
             # Record the prompt tokens for future prefix matching.
             state.tokens = list(raw_input_ids)
             state.next_position = prompt_tokens
-            logger.info(
-                f"[prefill-branch] FULL prefill done in {time.time() - branch_start:.2f}s"
+            print(
+                f"[prefill-branch] FULL prefill done in {time.time() - branch_start:.2f}s",
+                flush=True,
             )
 
         else:
@@ -686,9 +689,10 @@ def _rank0_pipeline_generate(
 
             new_tokens = raw_input_ids[common_len:]
             delta_seq_len = len(new_tokens)
-            logger.info(
+            print(
                 f"[prefill-branch] running INCREMENTAL prefill "
-                f"(common_len={common_len}, delta={delta_seq_len})"
+                f"(common_len={common_len}, delta={delta_seq_len})",
+                flush=True,
             )
 
             prompt_tensor = (
@@ -724,9 +728,10 @@ def _rank0_pipeline_generate(
 
             state.tokens = list(raw_input_ids)
             state.next_position = prompt_tokens
-            logger.info(
+            print(
                 f"[prefill-branch] INCREMENTAL prefill done in "
-                f"{time.time() - branch_start:.2f}s"
+                f"{time.time() - branch_start:.2f}s",
+                flush=True,
             )
 
         prefill_time = time.time() - prefill_start
