@@ -225,6 +225,19 @@ def _decide_prefill_strategy(
         f"new_prompt_tokens={prompt_tokens} common_len={common_len} "
         f"delta={delta} use_incremental={use_incremental}"
     )
+    if common_len < _MIN_REUSABLE_PREFIX and len(state.tokens) >= _MIN_REUSABLE_PREFIX:
+        # Unexpected low overlap — dump prefixes so we can see where they
+        # diverge. Expected cause: prompt reconstruction across turns is not
+        # byte-identical (e.g., chat template appends a variable stamp).
+        divergence = common_len
+        stored_window = state.tokens[max(0, divergence - 4): divergence + 12]
+        incoming_window = input_ids[max(0, divergence - 4): divergence + 12]
+        logger.warning(
+            f"[prefix-cache low-overlap] diverge@{divergence} "
+            f"stored_head={state.tokens[:20]} "
+            f"incoming_head={input_ids[:20]} "
+            f"stored_window={stored_window} incoming_window={incoming_window}"
+        )
 
     if use_incremental:
         return "incremental", common_len
