@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
+from tinygrad.dtype import dtypes
 from tinygrad.tensor import Tensor
 
 from exo.worker.engines.tinygrad.cache import KVCache
@@ -83,17 +85,33 @@ def grouped_query_attention(
     scores: Tensor = (q @ k_attn.transpose(-2, -1)) * scale
 
     if isinstance(position_offset, int):
-        # Prefill: standard causal mask over (seq_len × seq_len).
-        # All positions in the local K,V are valid, so no unfilled-position mask needed.
+        # Prefill from scratch: local K,V only (no prior cache), standard causal mask.
         if seq_len > 1:
             causal_mask = Tensor.ones(seq_len, seq_len).triu(1).reshape(1, 1, seq_len, seq_len)  # pyright: ignore[reportUnknownMemberType]
             scores = scores + causal_mask * float("-1e9")
-    else:
-        # Decode: mask unfilled positions in the full cache.
+    elif seq_len == 1:
+        # Single-token decode: only the unfilled-positions mask needed (current row is the
+        # only query position and is trivially causal against itself).
         valid_len = cache_position + seq_len  # pyright: ignore[reportOperatorIssue, reportUnknownVariableType]
         col_indeces: Tensor = cache.col_indices
         unfilled_mask: Tensor = col_indeces >= valid_len  # pyright: ignore[reportOperatorIssue, reportUnknownVariableType]
         scores = scores + unfilled_mask * float("-1e9")  # pyright: ignore[reportUnknownVariableType]
+    else:
+        # Batched incremental prefill: Tensor position_offset, seq_len > 1.
+        # Each output row i (absolute position cache_position + i) may only
+        # attend to key columns <= cache_position + i. col_indices is a
+        # [max_seq_len] arange tensor the KVCache exposes. Broadcast against
+        # per-row absolute positions to build a [1, 1, seq_len, max_seq_len]
+        # disallow mask that also naturally masks unfilled positions (any
+        # col > cache_position + seq_len - 1 is excluded).
+        col_indeces_all: Tensor = cache.col_indices  # shape [1, 1, 1, max_seq_len]
+        row_positions = cast(
+            Tensor, cache_position
+        ) + Tensor.arange(seq_len, dtype=dtypes.int32)  # pyright: ignore[reportUnknownMemberType] # shape [seq_len]
+        row_positions = row_positions.reshape(1, 1, seq_len, 1)  # pyright: ignore[reportUnknownMemberType]
+        col_indeces_row = col_indeces_all.reshape(1, 1, 1, -1)  # pyright: ignore[reportUnknownMemberType]
+        disallow_mask: Tensor = col_indeces_row > row_positions
+        scores = scores + disallow_mask * float("-1e9")
 
     attn_weights: Tensor = scores.softmax(axis=-1)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
     out: Tensor = attn_weights @ v_attn  # pyright: ignore[reportUnknownVariableType]

@@ -1,3 +1,5 @@
+from typing import cast
+
 from tinygrad.dtype import dtypes
 from tinygrad.tensor import Tensor
 
@@ -36,12 +38,30 @@ class KVCache:
         positions = self._positions
 
         if isinstance(position, Tensor):
-            mask = positions == position
+            # position is a scalar Tensor (shape [1]) giving the start slot.
+            # For seq_len == 1 (single-token decode) or seq_len > 1 (batched
+            # incremental prefill), write tokens into cache slots
+            # [position, position + seq_len).
+            #
+            # Strategy: for each cache slot s in [0, max_seq_len), select the
+            # corresponding source token index t = s - position if 0 <= t < seq_len,
+            # else keep the existing cache value.
+            #
+            # Build slot_offset: (1, 1, max_seq_len, 1) − (1,) → (1, 1, max_seq_len, 1)
+            all_slots = Tensor.arange(self.max_seq_len, dtype=dtypes.int32).reshape(1, 1, self.max_seq_len, 1)  # pyright: ignore[reportUnknownMemberType]
+            slot_offset = all_slots - position
+            in_range: Tensor = (slot_offset >= 0) & (slot_offset < seq_len)
+            # Clamp offset so gather is in-bounds even for out-of-range slots
+            safe_offset: Tensor = cast(Tensor, slot_offset.clip(0, seq_len - 1))  # pyright: ignore[reportUnknownMemberType]
+            # key shape: (1, kv_heads, seq_len, head_dim)
+            # Gather along seq dim: (1, kv_heads, max_seq_len, head_dim)
+            gathered_k = key.half()[:, :, safe_offset.reshape(self.max_seq_len), :]  # pyright: ignore[reportUnknownMemberType]
+            gathered_v = value.half()[:, :, safe_offset.reshape(self.max_seq_len), :]  # pyright: ignore[reportUnknownMemberType]
             self.keys[layers_idx] = Tensor.where(
-                mask, key.half(), self.keys[layers_idx]
+                in_range, gathered_k, self.keys[layers_idx]
             )
             self.values[layers_idx] = Tensor.where(
-                mask, value.half(), self.values[layers_idx]
+                in_range, gathered_v, self.values[layers_idx]
             )
         else:
             mask = (positions >= position) & (positions < position + seq_len)

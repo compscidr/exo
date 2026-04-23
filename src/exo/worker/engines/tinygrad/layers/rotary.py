@@ -33,10 +33,13 @@ def apply_rope(
     sin = sin_freqs
 
     if isinstance(position_offset, Tensor):
-        # position_offset is shape (1,) — index into full tables.
-        # cos_freqs is (max_seq_len, dim/2), result: (1, dim/2) → (1, 1, 1, dim/2)
-        cos = cos_freqs[position_offset].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
-        sin = sin_freqs[position_offset].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
+        # position_offset is shape (1,) — scalar start position for this batch.
+        # For seq_len == 1 (decode): single row; for seq_len > 1 (batched
+        # incremental prefill): index rows [offset, offset+1, ..., offset+seq_len-1].
+        # cos_freqs is (max_seq_len, dim/2); result: (seq_len, dim/2) → (1, 1, seq_len, dim/2)
+        positions = (position_offset + Tensor.arange(seq_len, dtype=dtypes.int32)).reshape(seq_len)  # pyright: ignore[reportUnknownMemberType]
+        cos = cos_freqs[positions].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
+        sin = sin_freqs[positions].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
     else:
         cos = cos_freqs[position_offset:position_offset + seq_len].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
         sin = sin_freqs[position_offset:position_offset + seq_len].reshape(1, 1, seq_len, -1)  # pyright: ignore[reportUnknownMemberType]
