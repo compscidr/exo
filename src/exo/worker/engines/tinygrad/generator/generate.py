@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+from loguru import logger
 
 if TYPE_CHECKING:
     from exo.worker.engines.tinygrad.pipeline_group import PipelineGroup
@@ -219,12 +220,10 @@ def _decide_prefill_strategy(
         and delta <= int(prompt_tokens * _MAX_INCREMENTAL_FRACTION)
     )
 
-    import sys as _sys
-    print(
+    logger.info(
         f"[prefix-cache decision] state_tokens={len(state.tokens)} "
         f"new_prompt_tokens={prompt_tokens} common_len={common_len} "
-        f"delta={delta} use_incremental={use_incremental}",
-        file=_sys.stderr, flush=True,
+        f"delta={delta} use_incremental={use_incremental}"
     )
 
     if use_incremental:
@@ -607,7 +606,12 @@ def _rank0_pipeline_generate(
     state: PrefixCacheState
 
     try:
+        branch_start = time.time()
         if strategy == "full" or prior_state is None:
+            logger.info(
+                f"[prefill-branch] running FULL prefill "
+                f"(prompt_tokens={prompt_tokens}, prior_state={prior_state is not None})"
+            )
             # ── Full prefill from scratch ─────────────────────────────────────
             # Discard any prior cache, allocate fresh, run the complete batched
             # prefill at position_offset=0, and signal workers to also reset via
@@ -653,6 +657,9 @@ def _rank0_pipeline_generate(
             # Record the prompt tokens for future prefix matching.
             state.tokens = list(raw_input_ids)
             state.next_position = prompt_tokens
+            logger.info(
+                f"[prefill-branch] FULL prefill done in {time.time() - branch_start:.2f}s"
+            )
 
         else:
             # ── Incremental prefill ───────────────────────────────────────────
@@ -666,6 +673,10 @@ def _rank0_pipeline_generate(
 
             new_tokens = raw_input_ids[common_len:]
             delta_seq_len = len(new_tokens)
+            logger.info(
+                f"[prefill-branch] running INCREMENTAL prefill "
+                f"(common_len={common_len}, delta={delta_seq_len})"
+            )
 
             prompt_tensor = (
                 Tensor(new_tokens, dtype=dtypes.int32).reshape(1, -1).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
@@ -700,6 +711,10 @@ def _rank0_pipeline_generate(
 
             state.tokens = list(raw_input_ids)
             state.next_position = prompt_tokens
+            logger.info(
+                f"[prefill-branch] INCREMENTAL prefill done in "
+                f"{time.time() - branch_start:.2f}s"
+            )
 
         prefill_time = time.time() - prefill_start
         prompt_tps = prompt_tokens / max(prefill_time, 1e-9)
