@@ -356,10 +356,19 @@ def _worker_pipeline_loop(
         TAG_STOP,
         decode_hidden,
     )
+    from exo.worker.engines.tinygrad.prefix_cache import (
+        PrefixCacheState,
+        prefix_cache_registry,
+    )
 
-    cache = _make_kv_cache(model)
+    registry = prefix_cache_registry()
+    state = registry.get(id(model))
+    if state is None:
+        state = PrefixCacheState(cache=_make_kv_cache(model))
+        registry[id(model)] = state
+    cache = state.cache
 
-    position: int = 0
+    position: int = state.next_position
     first = True
     num_layers = len(model.layers)
     hidden_dim = model.config.hidden_size
@@ -375,14 +384,32 @@ def _worker_pipeline_loop(
 
         if tag == TAG_STOP:
             # Propagate stop downstream and exit.
+            # DO NOT clear the registry — the cache persists for the next session.
             group.send_stop()
             return
 
         if tag == TAG_HIDDEN:
-            _position_offset, arr = decode_hidden(payload)
+            recv_position_offset, arr = decode_hidden(payload)
             # arr shape: [batch, seq_len, hidden_dim]
             arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
             seq_len = int(arr_shape[1])
+
+            # Session-reset semantics: position_offset=0 means rank 0 wants to
+            # start fresh. If our cache has already been written to, drop it.
+            if recv_position_offset == 0 and state.next_position > 0:
+                state.cache = _make_kv_cache(model)
+                state.next_position = 0
+                cache = state.cache
+                # Invalidate JIT state so it's rebuilt against the fresh cache.
+                jit_decode = None
+                hidden_buf = None
+                position_buf = None
+                first = True
+                position = 0
+
+            # Use recv_position_offset as our authoritative position — rank 0
+            # is the source of truth for where in the cache this hidden should land.
+            position = recv_position_offset
 
             if first:
                 # Prefill path. Shape varies per prompt so no JIT yet;
@@ -398,7 +425,7 @@ def _worker_pipeline_loop(
                 with Context(BEAM=0):
                     output, _ = forward_pass(
                         model, hidden, cache,
-                        position_offset=0,
+                        position_offset=position,
                         rope_cos=model.rope_cos, rope_sin=model.rope_sin,
                     )
                     for i in range(len(cache.keys)):
@@ -413,6 +440,8 @@ def _worker_pipeline_loop(
                 jit_decode = _build_worker_jit_decode(model, cache)
                 hidden_buf = Tensor.empty(1, 1, hidden_dim, dtype=dtypes.uint16).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
                 position_buf = Tensor.empty(1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+
+                state.next_position = recv_position_offset + seq_len
             else:
                 # Decode path (JIT replay). seq_len is always 1 here; the
                 # JIT captures that shape. Copy the raw uint16 wire bytes
@@ -432,6 +461,8 @@ def _worker_pipeline_loop(
                 for i in range(num_layers):
                     cache.keys[i] = results[1 + i]
                     cache.values[i] = results[1 + num_layers + i]
+
+                state.next_position = recv_position_offset + seq_len
 
             if is_last:
                 # Last rank: sample a token from the logits and send back to rank 0.

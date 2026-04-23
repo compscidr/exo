@@ -9,11 +9,13 @@ correct shapes, correct ordering).
 from __future__ import annotations
 
 import socket
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from safetensors.numpy import save_file  # pyright: ignore[reportUnknownVariableType]
 
 from exo.shared.architecture.llama import LLAMA_SPEC
@@ -29,6 +31,7 @@ from exo.worker.engines.tinygrad.pipeline_group import (
     encode_hidden,
     encode_token,
 )
+from exo.worker.engines.tinygrad.weight_loader import TransformerWeights
 
 # ── Tiny-model constants (mirrors test_weight_loader_boundaries) ───────────
 
@@ -186,8 +189,12 @@ class _FakeGroup(PipelineGroup):
 
     # ── Helper to pre-load inbound messages ──────────────────────────────
 
-    def queue_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
-        self.inbound_queue.append((TAG_HIDDEN, encode_hidden(arr)))
+    def queue_hidden(
+        self,
+        arr: np.ndarray[Any, np.dtype[np.uint16]],
+        position_offset: int = 0,
+    ) -> None:
+        self.inbound_queue.append((TAG_HIDDEN, encode_hidden(arr, position_offset=position_offset)))
 
     def queue_stop(self) -> None:
         self.inbound_queue.append((TAG_STOP, b""))
@@ -198,6 +205,31 @@ class _FakeGroup(PipelineGroup):
 
 def _fake_group(rank: int, world_size: int) -> _FakeGroup:
     return _FakeGroup(rank=rank, world_size=world_size)
+
+
+# ── Fixtures ───────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def clear_prefix_cache_registry() -> Iterator[None]:
+    """Clear the prefix cache registry before and after every test.
+
+    The registry is module-level state in prefix_cache.py; without this
+    fixture, a cache populated by one test would bleed into the next.
+    """
+    from exo.worker.engines.tinygrad.prefix_cache import prefix_cache_registry
+    prefix_cache_registry().clear()
+    yield
+    prefix_cache_registry().clear()
+
+
+@pytest.fixture
+def tiny_pipeline_model(tmp_path: Path) -> TransformerWeights:
+    """A middle-rank TransformerWeights loaded from a tiny synthetic model."""
+    from exo.worker.engines.tinygrad.weight_loader import load_transformer_weights
+
+    _build_fake_model(tmp_path, with_lm_head=False)
+    config = _make_config()
+    return load_transformer_weights(tmp_path, config, is_first_rank=False, is_last_rank=False)
 
 
 # ── Tests ──────────────────────────────────────────────────────────────────
@@ -476,3 +508,93 @@ def test_worker_rank_generate_yields_nothing(tmp_path: Path) -> None:
 
     assert responses == [], f"worker rank should yield nothing, got {responses}"
     mock_loop.assert_called_once_with(weights, group, is_last=True)
+
+
+# ── Prefix-cache persistence tests (Task 5) ───────────────────────────────
+
+_PROMPT_TOKENS = 3  # matches _StubTokenizer.encode → [1, 2, 3]
+
+
+def test_worker_preserves_cache_on_position_offset_continuation(
+    tiny_pipeline_model: TransformerWeights,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 1: HIDDEN at position_offset=0, then STOP. Session 2: HIDDEN at
+    position_offset=N (continuation), then STOP. Worker must reuse the KV
+    cache across sessions — _make_kv_cache should be called exactly once.
+    """
+    from exo.worker.engines.tinygrad.cache import KVCache
+    from exo.worker.engines.tinygrad.generator import generate as gen_mod
+    from exo.worker.engines.tinygrad.generator.generate import (
+        _worker_pipeline_loop,  # pyright: ignore[reportPrivateUsage]
+    )
+    from exo.worker.engines.tinygrad.prefix_cache import prefix_cache_registry
+
+    prefix_cache_registry().clear()
+
+    calls: list[int] = []
+    original_make_kv_cache = gen_mod._make_kv_cache  # pyright: ignore[reportPrivateUsage]
+
+    def counting_make_kv_cache(model: TransformerWeights) -> KVCache:
+        calls.append(1)
+        return original_make_kv_cache(model)
+
+    monkeypatch.setattr(gen_mod, "_make_kv_cache", counting_make_kv_cache)
+
+    # Session 1: one HIDDEN at pos=0 then STOP.
+    group_s1 = _FakeGroup(rank=1, world_size=2)
+    _prefill_hidden = np.zeros((1, _PROMPT_TOKENS, _HIDDEN), dtype=np.uint16)
+    group_s1.queue_hidden(_prefill_hidden, position_offset=0)
+    group_s1.queue_stop()
+    _worker_pipeline_loop(tiny_pipeline_model, group_s1, is_last=False)
+
+    # Session 2: one HIDDEN at pos=continued, then STOP.
+    group_s2 = _FakeGroup(rank=1, world_size=2)
+    _continuation_hidden = np.zeros((1, 1, _HIDDEN), dtype=np.uint16)
+    group_s2.queue_hidden(_continuation_hidden, position_offset=_PROMPT_TOKENS)
+    group_s2.queue_stop()
+    _worker_pipeline_loop(tiny_pipeline_model, group_s2, is_last=False)
+
+    assert len(calls) == 1, f"expected cache allocated once, got {len(calls)}"
+
+
+def test_worker_resets_cache_on_position_offset_zero(
+    tiny_pipeline_model: TransformerWeights,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 1 populates cache. Session 2 opens with position_offset=0
+    (fresh session) — worker must reset the cache and re-allocate.
+    """
+    from exo.worker.engines.tinygrad.cache import KVCache
+    from exo.worker.engines.tinygrad.generator import generate as gen_mod
+    from exo.worker.engines.tinygrad.generator.generate import (
+        _worker_pipeline_loop,  # pyright: ignore[reportPrivateUsage]
+    )
+    from exo.worker.engines.tinygrad.prefix_cache import prefix_cache_registry
+
+    prefix_cache_registry().clear()
+
+    calls: list[int] = []
+    original_make_kv_cache = gen_mod._make_kv_cache  # pyright: ignore[reportPrivateUsage]
+
+    def counting_make_kv_cache(model: TransformerWeights) -> KVCache:
+        calls.append(1)
+        return original_make_kv_cache(model)
+
+    monkeypatch.setattr(gen_mod, "_make_kv_cache", counting_make_kv_cache)
+
+    # Session 1: pos=0 prefill then STOP.
+    group_s1 = _FakeGroup(rank=1, world_size=2)
+    _prefill_hidden = np.zeros((1, _PROMPT_TOKENS, _HIDDEN), dtype=np.uint16)
+    group_s1.queue_hidden(_prefill_hidden, position_offset=0)
+    group_s1.queue_stop()
+    _worker_pipeline_loop(tiny_pipeline_model, group_s1, is_last=False)
+
+    # Session 2: pos=0 again = fresh session; should reset.
+    group_s2 = _FakeGroup(rank=1, world_size=2)
+    group_s2.queue_hidden(_prefill_hidden, position_offset=0)
+    group_s2.queue_stop()
+    _worker_pipeline_loop(tiny_pipeline_model, group_s2, is_last=False)
+
+    # Expected: session 1 call (initial), session 2 call (reset). Exactly 2.
+    assert len(calls) == 2, f"expected cache allocated twice (init + reset), got {len(calls)}"
