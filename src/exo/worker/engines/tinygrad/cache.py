@@ -64,7 +64,6 @@ class KVCache:
                 in_range, gathered_v, self.values[layers_idx]
             )
         else:
-            mask = (positions >= position) & (positions < position + seq_len)
             pad_prev = position
             pad_next = self.max_seq_len - position - seq_len
             new_k = key.pad(
@@ -74,17 +73,22 @@ class KVCache:
                 ((0, 0), (0, 0), (pad_prev, pad_next), (0, 0))
             ).half()
 
-            self.keys[layers_idx] = new_k
-            self.values[layers_idx] = new_v
-
             if position > 0:
-                self.keys[layers_idx] = Tensor.where(
-                    mask, new_k, self.keys[layers_idx]
-                )
-
-                self.values[layers_idx] = Tensor.where(
-                    mask, new_v, self.values[layers_idx]
-                )
+                # Preserve existing cache slots outside [position, position+seq_len).
+                # Must capture old cache tensors *before* any reassignment — an
+                # earlier version that did `self.keys = new_k; if position > 0:
+                # self.keys = where(mask, new_k, self.keys)` was trivially
+                # self-referential (second RHS was the already-overwritten new_k)
+                # and wiped the cache from position 0 to position.
+                mask = (positions >= position) & (positions < position + seq_len)
+                old_keys = self.keys[layers_idx]
+                old_values = self.values[layers_idx]
+                self.keys[layers_idx] = Tensor.where(mask, new_k, old_keys)
+                self.values[layers_idx] = Tensor.where(mask, new_v, old_values)
+            else:
+                # Fresh prefill: padded new_k is the entire cache.
+                self.keys[layers_idx] = new_k
+                self.values[layers_idx] = new_v
 
         return self.keys[layers_idx], self.values[layers_idx]
 

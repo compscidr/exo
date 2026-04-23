@@ -482,10 +482,23 @@ def _worker_pipeline_loop(
                     .contiguous()
                     .realize()
                 )
+                # Incremental prefill (position > 0): pass position as a Tensor
+                # so attention takes the batched-incremental path that *reads*
+                # the existing cache through the combined causal+unfilled mask.
+                # Int position_offset > 0 with seq_len > 1 is a bug — it would
+                # compute attention against only the delta's local K/V and
+                # ignore everything we already have cached.
+                effective_position_offset: int | Tensor
+                if position == 0:
+                    effective_position_offset = 0
+                else:
+                    effective_position_offset = (
+                        Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+                    )
                 with Context(BEAM=0):
                     output, _ = forward_pass(
                         model, hidden, cache,
-                        position_offset=position,
+                        position_offset=effective_position_offset,
                         rope_cos=model.rope_cos, rope_sin=model.rope_sin,
                     )
                     for i in range(len(cache.keys)):
