@@ -510,9 +510,11 @@ def _worker_pipeline_loop(
                 token_result = sample_token(output, temperature=DEFAULT_TEMPERATURE, top_p=DEFAULT_TOP_P)
                 group.send_token(token_result.token_id, stop=False)
             else:
-                # Middle rank: convert hidden state to fp16 numpy and forward downstream.
+                # Middle rank: forward downstream at the same write position
+                # this rank used. Without position_offset, the next rank's
+                # reset-on-zero logic would wipe its cache on every step.
                 hidden_np = _tensor_to_np(output)
-                group.send_hidden(hidden_np)
+                group.send_hidden(hidden_np, position_offset=position)
 
             position += seq_len
             first = False
@@ -767,7 +769,10 @@ def _rank0_pipeline_generate(
             _inst_t1 = time.perf_counter()
 
             decode_np = _tensor_to_np(decode_hidden)
-            group.send_hidden(decode_np)
+            # Pass position so the worker writes into the right cache slot.
+            # Without this (default position_offset=0), the worker's
+            # reset-on-zero logic would wipe its cache on every decode step.
+            group.send_hidden(decode_np, position_offset=position)
             _inst_t2 = time.perf_counter()
 
             token_id, stop = group.recv_token()
