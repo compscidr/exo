@@ -176,6 +176,14 @@ def _make_kv_cache(model: TransformerWeights) -> KVCache:
 _MIN_REUSABLE_PREFIX: int = 16
 _MAX_INCREMENTAL_FRACTION: float = 0.5
 
+# Kill-switch for the incremental prefill path. Set EXO_DISABLE_PREFIX_CACHE=1
+# in the runner environment to force every request to run full prefill (this
+# still uses the wire-format position_offset=0 → worker-reset path, so the
+# worker's KV cache is freshly allocated every request).
+def _prefix_cache_disabled() -> bool:
+    import os
+    return os.environ.get("EXO_DISABLE_PREFIX_CACHE", "").lower() in ("1", "true", "yes")
+
 
 def _decide_prefill_strategy(
     state: "PrefixCacheState | None",
@@ -195,6 +203,9 @@ def _decide_prefill_strategy(
     """
     from exo.worker.engines.tinygrad.prefix_cache import find_common_prefix_length
 
+    if _prefix_cache_disabled():
+        return "full", 0
+
     if state is None or state.next_position == 0:
         return "full", 0
 
@@ -206,6 +217,14 @@ def _decide_prefill_strategy(
         common_len >= _MIN_REUSABLE_PREFIX
         and delta > 0
         and delta <= int(prompt_tokens * _MAX_INCREMENTAL_FRACTION)
+    )
+
+    import sys as _sys
+    print(
+        f"[prefix-cache decision] state_tokens={len(state.tokens)} "
+        f"new_prompt_tokens={prompt_tokens} common_len={common_len} "
+        f"delta={delta} use_incremental={use_incremental}",
+        file=_sys.stderr, flush=True,
     )
 
     if use_incremental:
