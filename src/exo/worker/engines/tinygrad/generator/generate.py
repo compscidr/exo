@@ -3,12 +3,13 @@ import struct
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 if TYPE_CHECKING:
     from exo.worker.engines.tinygrad.pipeline_group import PipelineGroup
+    from exo.worker.engines.tinygrad.prefix_cache import PrefixCacheState
 
 from tinygrad.dtype import dtypes
 from tinygrad.engine.jit import TinyJit
@@ -170,6 +171,46 @@ def _make_kv_cache(model: TransformerWeights) -> KVCache:
         cache.keys[i] = cache.keys[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
         cache.values[i] = cache.values[i].contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
     return cache
+
+
+_MIN_REUSABLE_PREFIX: int = 16
+_MAX_INCREMENTAL_FRACTION: float = 0.5
+
+
+def _decide_prefill_strategy(
+    state: "PrefixCacheState | None",
+    input_ids: list[int],
+) -> tuple[Literal["full", "incremental"], int]:
+    """Determine whether to run a full or incremental prefill for rank 0.
+
+    Returns a tuple of (strategy, common_len) where:
+    - strategy is ``"full"`` or ``"incremental"``.
+    - common_len is the number of cached prefix tokens that can be reused.
+
+    Incremental prefill is chosen when:
+    - A prior cache state exists with ``next_position > 0``,
+    - The common prefix length is at least ``_MIN_REUSABLE_PREFIX``,
+    - The delta (new tokens not in the cache) is > 0 and no more than
+      ``_MAX_INCREMENTAL_FRACTION`` of the total new prompt length.
+    """
+    from exo.worker.engines.tinygrad.prefix_cache import find_common_prefix_length
+
+    if state is None or state.next_position == 0:
+        return "full", 0
+
+    prompt_tokens = len(input_ids)
+    common_len = find_common_prefix_length(state.tokens, input_ids)
+    delta = prompt_tokens - common_len
+
+    use_incremental = (
+        common_len >= _MIN_REUSABLE_PREFIX
+        and delta > 0
+        and delta <= int(prompt_tokens * _MAX_INCREMENTAL_FRACTION)
+    )
+
+    if use_incremental:
+        return "incremental", common_len
+    return "full", common_len
 
 
 def _single_rank_generate(
@@ -498,62 +539,139 @@ def _rank0_pipeline_generate(
     last rank to sample a token, then drives the decode loop.  Wraps everything
     in try/finally so that the pipeline workers always receive a STOP signal even
     if the caller drops the generator early (e.g., warmup after N tokens).
+
+    On each request, consults the prefix_cache_registry to check whether the
+    new prompt shares a long common prefix with the previously cached token
+    sequence. If so, runs an incremental prefill — only the delta tokens are
+    forwarded at position_offset=common_len — instead of the full batched prefill
+    from scratch. See ``_decide_prefill_strategy`` for the threshold logic.
     """
-    input_ids = _encode_prompt(tokenizer, prompt)
+    from exo.worker.engines.tinygrad.prefix_cache import (
+        PrefixCacheState,
+        prefix_cache_registry,
+    )
+
+    raw_input_ids = _encode_prompt(tokenizer, prompt)
+    prompt_tokens = len(raw_input_ids)
 
     max_tokens = task.max_output_tokens or DEFAULT_MAX_TOKENS
     # temperature, top_p, and logprob settings are not used on rank 0:
     # rank 0 has no lm_head so it cannot sample; sampling is done by the last rank.
 
     eos_ids = _get_eos_ids(tokenizer, model.config)
-    prompt_tokens = len(input_ids)
-    input_ids = _pad_to_bucket(input_ids)
 
-    if not input_ids:
+    if not raw_input_ids:
         raise ValueError("Prompt must contain at least one token")
 
-    cache = _make_kv_cache(model)
+    registry = prefix_cache_registry()
+    prior_state = registry.get(id(model))
+    strategy, common_len = _decide_prefill_strategy(prior_state, raw_input_ids)
 
     prefill_start = time.time()
 
+    # state is set by whichever prefill branch runs; always non-None after the branch.
+    state: PrefixCacheState
+
     try:
-        # ── Prefill ──────────────────────────────────────────────────────────
-        prompt_tensor = Tensor(input_ids, dtype=dtypes.int32).reshape(1, -1).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-        with Context(BEAM=0):
-            hidden_or_logits, _ = forward_pass(
-                model, prompt_tensor, cache,
-                position_offset=0,
-                rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+        if strategy == "full" or prior_state is None:
+            # ── Full prefill from scratch ─────────────────────────────────────
+            # Discard any prior cache, allocate fresh, run the complete batched
+            # prefill at position_offset=0, and signal workers to also reset via
+            # send_hidden(..., position_offset=0).
+            cache = _make_kv_cache(model)
+            state = PrefixCacheState(cache=cache, tokens=[], next_position=0)
+            registry[id(model)] = state
+
+            padded_ids = _pad_to_bucket(raw_input_ids)
+            prompt_tensor = Tensor(padded_ids, dtype=dtypes.int32).reshape(1, -1).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            with Context(BEAM=0):
+                hidden_or_logits, _ = forward_pass(
+                    model, prompt_tensor, cache,
+                    position_offset=0,
+                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                )
+                # Rank 0 is never the last rank in multi-rank mode (lm_head is None),
+                # so this is always a hidden state.
+                # Materialize the output and the whole cache in one scheduling
+                # pass — matches the single-rank prefill pattern and prevents
+                # stale/lazy cache tensors from corrupting later decode steps.
+                for i in range(len(cache.keys)):
+                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                hidden_or_logits = hidden_or_logits.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+
+            # Ship only the real (un-padded) prefill positions to downstream ranks.
+            # Slicing to [:, :prompt_tokens, :] strips the bucket-padding tokens so
+            # that each downstream rank's forward_pass populates exactly prompt_tokens
+            # KV-cache entries (positions 0..prompt_tokens-1), matching rank 0's cache.
+            # Sending only the last token would leave downstream KV caches with a
+            # single entry and produce garbage attention during decode.
+            prefill_hidden = hidden_or_logits[:, :prompt_tokens, :]
+            prefill_hidden = prefill_hidden.contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+
+            prefill_np = _tensor_to_np(prefill_hidden)
+            # position_offset=0 tells workers to reset their own cache for a fresh session.
+            group.send_hidden(prefill_np, position_offset=0)
+
+            # Wait for last rank to sample the first token.
+            token_id, stop = group.recv_token()
+
+            # Record the prompt tokens for future prefix matching.
+            state.tokens = list(raw_input_ids)
+            state.next_position = prompt_tokens
+
+        else:
+            # ── Incremental prefill ───────────────────────────────────────────
+            # Cache is already valid for positions [0, common_len). Run a single
+            # batched forward_pass on the delta tokens (positions [common_len, prompt_tokens))
+            # with position_offset=Tensor([common_len]). This activates the
+            # combined causal+unfilled attention mask path added in Task 1.
+            assert prior_state is not None  # guaranteed by _decide_prefill_strategy
+            cache = prior_state.cache
+            state = prior_state
+
+            new_tokens = raw_input_ids[common_len:]
+            delta_seq_len = len(new_tokens)
+
+            prompt_tensor = (
+                Tensor(new_tokens, dtype=dtypes.int32).reshape(1, -1).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
             )
-            # Rank 0 is never the last rank in multi-rank mode (lm_head is None),
-            # so this is always a hidden state.
-            # Materialize the output and the whole cache in one scheduling
-            # pass — matches the single-rank prefill pattern and prevents
-            # stale/lazy cache tensors from corrupting later decode steps.
-            for i in range(len(cache.keys)):
-                cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-            hidden_or_logits = hidden_or_logits.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+            position_tensor = (
+                Tensor([common_len], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            )
 
-        # Ship only the real (un-padded) prefill positions to downstream ranks.
-        # Slicing to [:, :prompt_tokens, :] strips the bucket-padding tokens so
-        # that each downstream rank's forward_pass populates exactly prompt_tokens
-        # KV-cache entries (positions 0..prompt_tokens-1), matching rank 0's cache.
-        # Sending only the last token would leave downstream KV caches with a
-        # single entry and produce garbage attention during decode.
-        prefill_hidden = hidden_or_logits[:, :prompt_tokens, :]
-        prefill_hidden = prefill_hidden.contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            # Uses the batched-incremental-prefill attention path:
+            # Tensor position_offset + seq_len > 1.
+            with Context(BEAM=0):
+                hidden_or_logits, _ = forward_pass(
+                    model, prompt_tensor, cache,
+                    position_offset=position_tensor,
+                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                )
+                for i in range(len(cache.keys)):
+                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                hidden_or_logits = hidden_or_logits.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
 
-        prefill_np = _tensor_to_np(prefill_hidden)
-        group.send_hidden(prefill_np)
+            # Ship only the delta positions to the worker, telling it where to
+            # write via position_offset=common_len. The worker will forward at
+            # the same offset, extending its KV cache without touching
+            # positions [0, common_len) which are already valid.
+            prefill_hidden = hidden_or_logits[:, :delta_seq_len, :]
+            prefill_hidden = prefill_hidden.contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            prefill_np = _tensor_to_np(prefill_hidden)
+            group.send_hidden(prefill_np, position_offset=common_len)
 
-        # Wait for last rank to sample the first token.
-        token_id, stop = group.recv_token()
+            token_id, stop = group.recv_token()
+
+            state.tokens = list(raw_input_ids)
+            state.next_position = prompt_tokens
 
         prefill_time = time.time() - prefill_start
         prompt_tps = prompt_tokens / max(prefill_time, 1e-9)
 
         position = prompt_tokens
+        cache = state.cache
 
         # ── JIT setup for the decode loop ────────────────────────────────────
         # Build the JIT against the cache *after* the prefill's contiguous+
@@ -576,6 +694,7 @@ def _rank0_pipeline_generate(
         _inst_recv_s = 0.0
         _inst_samples = 0
         _inst_every = 20
+        generated_token_ids: list[int] = []
         for token_idx in range(max_tokens):
             token_text: str = tokenizer.decode([token_id])  # pyright: ignore[reportAny]
 
@@ -611,6 +730,8 @@ def _rank0_pipeline_generate(
             if is_eos:
                 token_text = ""
 
+            generated_token_ids.append(token_id)
+
             # Logprobs are not available on rank 0 (no lm_head).
             yield GenerationResponse(
                 text=token_text, token=token_id,
@@ -619,6 +740,10 @@ def _rank0_pipeline_generate(
             )
 
             if finish_reason is not None:
+                # Persist the full context (prompt + generated) so the next
+                # request can prefix-match against the complete conversation.
+                state.tokens = list(raw_input_ids) + generated_token_ids
+                state.next_position = prompt_tokens + tokens_generated
                 # Return; the enclosing try/finally will send exactly one STOP
                 # and drain the ring-echo. Sending STOP here too would leave
                 # a second STOP in the downstream rank's recv buffer that the

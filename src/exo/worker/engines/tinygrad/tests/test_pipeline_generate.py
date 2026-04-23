@@ -558,6 +558,161 @@ def test_worker_preserves_cache_on_position_offset_continuation(
     assert len(calls) == 1, f"expected cache allocated once, got {len(calls)}"
 
 
+def test_rank0_prefix_match_reuses_cache(tmp_path: Path) -> None:
+    """First request populates the registry. Second request with an extended
+    prompt should use incremental prefill: send_hidden called with
+    position_offset > 0 AND the shipped hidden has fewer positions than
+    the first call's (delta only, not the full prompt).
+
+    Strategy: use a custom tokenizer that returns distinct, controllable
+    token sequences, and test the branch-selection helper directly to
+    avoid needing full tensor machinery end-to-end.
+    """
+    from exo.worker.engines.tinygrad.cache import KVCache
+    from exo.worker.engines.tinygrad.generator.generate import (
+        _decide_prefill_strategy,  # pyright: ignore[reportPrivateUsage]
+    )
+    from exo.worker.engines.tinygrad.prefix_cache import (
+        PrefixCacheState,
+        prefix_cache_registry,
+    )
+
+    prefix_cache_registry().clear()
+
+    # Build a minimal KVCache for the state (we don't actually run forward_pass).
+    cache = KVCache(
+        num_layers=_NUM_LAYERS,
+        num_kv_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        max_seq_len=256,
+    )
+
+    # Simulate a prior session: prompt was [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    # (10 tokens; comfortably above MIN_REUSABLE_PREFIX=16 won't hold but let's use a
+    # smaller threshold test — the helper uses the constants defined in generate.py).
+    # For the helper test we'll use 20 tokens to clear MIN_REUSABLE_PREFIX=16.
+    prior_tokens: list[int] = list(range(1, 21))  # 20 tokens
+    state = PrefixCacheState(cache=cache, tokens=prior_tokens, next_position=len(prior_tokens))
+
+    # Case 1: new prompt extends the prior (shares first 20, adds 4 more) → incremental.
+    new_tokens_incremental: list[int] = prior_tokens + [21, 22, 23, 24]
+    strategy, common = _decide_prefill_strategy(state, new_tokens_incremental)
+    assert strategy == "incremental", (
+        f"expected incremental strategy but got {strategy!r} "
+        f"(common_len={common}, prompt_len={len(new_tokens_incremental)}, delta={len(new_tokens_incremental)-common})"
+    )
+    assert common == 20, f"expected common_len=20, got {common}"
+
+    # Case 2: no overlap at all → full prefill.
+    new_tokens_full: list[int] = list(range(100, 124))  # 24 tokens, no overlap
+    strategy2, common2 = _decide_prefill_strategy(state, new_tokens_full)
+    assert strategy2 == "full", f"expected full strategy but got {strategy2!r}"
+    assert common2 == 0, f"expected common_len=0, got {common2}"
+
+    # Case 3: overlap exists but delta is too large (> MAX_INCREMENTAL_FRACTION=0.5).
+    # 20 tokens overlap, 25 new tokens → delta fraction = 25/45 ≈ 0.55 > 0.5 → full.
+    new_tokens_large_delta: list[int] = prior_tokens + list(range(100, 125))  # 20+25=45
+    strategy3, common3 = _decide_prefill_strategy(state, new_tokens_large_delta)
+    assert strategy3 == "full", (
+        f"expected full strategy for large delta but got {strategy3!r} "
+        f"(common={common3}, prompt_len={len(new_tokens_large_delta)}, delta={len(new_tokens_large_delta)-common3})"
+    )
+
+    # Case 4: state is None → full prefill.
+    strategy4, common4 = _decide_prefill_strategy(None, new_tokens_incremental)
+    assert strategy4 == "full", f"expected full for None state, got {strategy4!r}"
+    assert common4 == 0
+
+    # Case 5: state exists but next_position == 0 (empty cache) → full prefill.
+    empty_state = PrefixCacheState(cache=cache, tokens=[], next_position=0)
+    strategy5, common5 = _decide_prefill_strategy(empty_state, new_tokens_incremental)
+    assert strategy5 == "full", f"expected full for empty state, got {strategy5!r}"
+    assert common5 == 0
+
+
+def test_rank0_prefix_match_send_hidden_position_offset(tmp_path: Path) -> None:
+    """End-to-end: second request with an extended prompt must send_hidden
+    with position_offset == common_len (> 0), not 0.
+    """
+    from exo.worker.engines.tinygrad.generator.generate import (
+        _rank0_pipeline_generate,  # pyright: ignore[reportPrivateUsage]
+    )
+    from exo.worker.engines.tinygrad.prefix_cache import prefix_cache_registry
+    from exo.worker.engines.tinygrad.weight_loader import load_transformer_weights
+
+    _build_fake_model(tmp_path)
+    config = _make_config()
+    weights = load_transformer_weights(tmp_path, config, is_first_rank=True, is_last_rank=False)
+
+    # Use a custom tokenizer: first request → 20 tokens, second → 24 tokens
+    # (same 20-token prefix + 4 new tokens).
+    class _ExtendingTokenizer:
+        eos_token_id: int = 999  # won't be hit during our test
+
+        _call_count: int = 0
+        _prior_tokens: list[int] = list(range(1, 21))  # 20 tokens
+
+        def encode(self, text: str) -> list[int]:
+            _ = text
+            _ExtendingTokenizer._call_count += 1
+            if _ExtendingTokenizer._call_count == 1:
+                return list(self._prior_tokens)
+            # Second call: same prefix + 4 new tokens (delta=4, fraction=4/24≈0.167 < 0.5)
+            return list(self._prior_tokens) + [21, 22, 23, 24]
+
+        def decode(self, ids: list[int]) -> str:
+            return " ".join(str(i) for i in ids)
+
+    tokenizer = _ExtendingTokenizer()
+    task_long = TextGenerationTaskParams(
+        model=CommonModelId("test-model"),
+        input=[InputMessage(role="user", content="hello")],
+        max_output_tokens=2,
+    )
+
+    # ── First request (full prefill) ──────────────────────────────────────
+    prefix_cache_registry().clear()
+    group1 = _fake_group(rank=0, world_size=2)
+    group1.queue_token(10, stop=False)
+    group1.queue_token(11, stop=True)
+    list(_rank0_pipeline_generate(weights, tokenizer, task_long, "prompt1", group1))
+
+    # After first request, registry should have state populated.
+    state_after_first = prefix_cache_registry().get(id(weights))
+    assert state_after_first is not None, "registry should have state after first request"
+    assert state_after_first.next_position > 0, "next_position should be > 0 after first request"
+
+    # First request prefill send_hidden should have position_offset == 0.
+    assert len(group1.sent_hiddens) >= 1
+    first_prefill_offset, _ = group1.sent_hiddens[0]
+    assert first_prefill_offset == 0, f"first prefill should use position_offset=0, got {first_prefill_offset}"
+
+    # ── Second request (incremental prefill) ─────────────────────────────
+    group2 = _fake_group(rank=0, world_size=2)
+    group2.queue_token(20, stop=False)
+    group2.queue_token(21, stop=True)
+    list(_rank0_pipeline_generate(weights, tokenizer, task_long, "prompt2", group2))
+
+    # The second request's first send_hidden should have position_offset > 0
+    # (the incremental prefill sends delta from common_len onward).
+    assert len(group2.sent_hiddens) >= 1, "expected at least one send_hidden on second request"
+    second_prefill_offset, second_hidden = group2.sent_hiddens[0]
+    assert second_prefill_offset > 0, (
+        f"second request should use incremental prefill (position_offset>0), "
+        f"got position_offset={second_prefill_offset}"
+    )
+    # The delta hidden should be smaller than the original 20-token prefill
+    # (only 4 new tokens shipped, not 20).
+    second_hidden_shape: tuple[int, ...] = second_hidden.shape  # pyright: ignore[reportAny]
+    assert second_hidden_shape[1] < 20, (
+        f"incremental prefill should ship only delta tokens (< 20), "
+        f"got shape[1]={second_hidden_shape[1]}"
+    )
+    assert second_hidden_shape[1] == 4, (
+        f"expected exactly 4 delta tokens shipped, got {second_hidden_shape[1]}"
+    )
+
+
 def test_worker_resets_cache_on_position_offset_zero(
     tiny_pipeline_model: TransformerWeights,
     monkeypatch: pytest.MonkeyPatch,
