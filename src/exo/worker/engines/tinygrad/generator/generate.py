@@ -927,6 +927,16 @@ def warmup_inference(model: TransformerWeights, tokenizer: Any, group: "Pipeline
     if group is None or group.rank == 0:
         _warmup_prefill_buckets(model)
 
+    # The warmup prompt is tokenized without a system message, so Qwen-family
+    # templates substitute their built-in default ("You are Qwen, created by
+    # Alibaba Cloud. ..."). That poisons the prefix cache: the first real chat
+    # request — which carries the dashboard's own system prompt — diverges
+    # inside the system block and gets zero prefix reuse. Drop the warmup's
+    # cached state on both rank 0 and workers so the first real turn starts
+    # clean. Kernel-level JIT caches are unaffected.
+    from exo.worker.engines.tinygrad.prefix_cache import clear_prefix_cache
+    clear_prefix_cache(id(model))
+
     return tokens_generated
 
 
