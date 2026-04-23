@@ -100,6 +100,48 @@ def _build_jit_decode(
     return decode
 
 
+def _build_worker_jit_decode(
+    weights: TransformerWeights,
+    cache: KVCache,
+) -> Callable[..., tuple[Tensor, ...]]:
+    """Build a JIT-captured decode step for a worker rank.
+
+    Differs from ``_build_jit_decode`` in one respect: the ``hidden_wire``
+    input is a uint16 buffer carrying bf16 bit patterns (the on-wire
+    format). The first op in the JIT graph bitcasts back to bf16 and
+    casts to the model's activation dtype so forward_pass sees the right
+    tensor dtype. Everything downstream is identical to the rank-0/single
+    JIT — forward_pass dispatches on whether ``weights.lm_head`` is
+    populated to return either a hidden state (middle rank) or logits
+    (last rank).
+    """
+    num_layers = len(weights.layers)
+    assert weights.rope_cos is not None
+    activation_dtype = weights.rope_cos.dtype
+
+    @TinyJit
+    def decode(
+        hidden_wire: Tensor, position: Tensor,
+        rope_cos_table: Tensor, rope_sin_table: Tensor,
+        *cache_kv: Tensor,
+    ) -> tuple[Tensor, ...]:
+        x = hidden_wire.bitcast(dtypes.bfloat16).cast(activation_dtype)
+        for i in range(num_layers):
+            cache.keys[i] = cache_kv[i]
+            cache.values[i] = cache_kv[num_layers + i]
+
+        output, _ = forward_pass(
+            weights, x, cache,
+            position_offset=position,
+            rope_cos=rope_cos_table, rope_sin=rope_sin_table,
+        )
+        output = output.realize(*cache.keys, *cache.values)
+
+        return (output, *cache.keys, *cache.values)
+
+    return decode
+
+
 def _tensor_to_np(t: Tensor) -> "np.ndarray[Any, np.dtype[np.uint16]]":
     """Convert a tinygrad Tensor to a writable uint16-packed bf16 ndarray.
 
@@ -319,6 +361,14 @@ def _worker_pipeline_loop(
 
     position: int = 0
     first = True
+    num_layers = len(model.layers)
+    hidden_dim = model.config.hidden_size
+
+    # JIT state — built lazily after the prefill (first HIDDEN arrival).
+    # Prefill stays non-JIT because its shape varies per prompt length.
+    jit_decode: Callable[..., tuple[Tensor, ...]] | None = None
+    hidden_buf: Tensor | None = None
+    position_buf: Tensor | None = None
 
     while True:
         tag, payload = group.recv_any()
@@ -334,45 +384,54 @@ def _worker_pipeline_loop(
             arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
             seq_len = int(arr_shape[1])
 
-            # The wire format is bf16 packed as uint16 (numpy has no bf16).
-            # Reinterpret the bit pattern as bf16, then cast to the model's
-            # internal activation dtype (matches rope_cos) so forward_pass's
-            # matmuls don't hit a dtype mismatch.
-            hidden = (
-                Tensor(arr)
-                .bitcast(dtypes.bfloat16)
-                .cast(model.rope_cos.dtype)  # pyright: ignore[reportUnknownMemberType]
-                .contiguous()
-                .realize()
-            )
-
-            # Prefill: pass position_offset=0 (int) so attention uses the
-            # local-only seq_len×seq_len path (correct and efficient here).
-            # Decode (first=False, seq_len=1): pass position_offset as a
-            # Tensor so attention takes the cache-reading branch — otherwise
-            # it ignores all prefill/prior-decode entries and produces garbage.
-            position_offset: "int | Tensor"
             if first:
-                position_offset = 0
-            else:
-                position_offset = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-
-            # Prefill shapes vary per prompt length and aren't cacheable,
-            # so disable BEAM. Decode shape is fixed (seq_len=1) so let
-            # BEAM search kernels like the runner bootstrap defaults to.
-            fwd_context: "contextlib.AbstractContextManager[object]" = (
-                Context(BEAM=0) if first else contextlib.nullcontext()
-            )
-            with fwd_context:
-                output, _ = forward_pass(
-                    model, hidden, cache,
-                    position_offset=position_offset,
-                    rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                # Prefill path. Shape varies per prompt so no JIT yet;
+                # BEAM is disabled because each prompt bucket hits a new
+                # kernel shape.
+                hidden = (
+                    Tensor(arr)
+                    .bitcast(dtypes.bfloat16)
+                    .cast(model.rope_cos.dtype)  # pyright: ignore[reportUnknownMemberType]
+                    .contiguous()
+                    .realize()
                 )
-                for i in range(len(cache.keys)):
-                    cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                    cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                output = output.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+                with Context(BEAM=0):
+                    output, _ = forward_pass(
+                        model, hidden, cache,
+                        position_offset=0,
+                        rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+                    )
+                    for i in range(len(cache.keys)):
+                        cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                        cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
+                    output = output.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+
+                # Build JIT and persistent buffers for the decode phase.
+                # Must happen *after* prefill's contiguous+realize dance —
+                # prefill creates new cache tensor objects and the JIT
+                # captures the post-prefill ones as its baseline.
+                jit_decode = _build_worker_jit_decode(model, cache)
+                hidden_buf = Tensor.empty(1, 1, hidden_dim, dtype=dtypes.uint16).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+                position_buf = Tensor.empty(1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+            else:
+                # Decode path (JIT replay). seq_len is always 1 here; the
+                # JIT captures that shape. Copy the raw uint16 wire bytes
+                # into hidden_buf's storage — bitcast+cast to activation
+                # dtype happens inside the JIT graph.
+                assert jit_decode is not None
+                assert hidden_buf is not None
+                assert position_buf is not None
+                hidden_buf._buffer().copyin(memoryview(bytearray(arr.tobytes())))  # pyright: ignore[reportPrivateUsage]
+                position_buf._buffer().copyin(memoryview(bytearray(struct.pack("=i", position))))  # pyright: ignore[reportPrivateUsage]
+                results = jit_decode(
+                    hidden_buf, position_buf,
+                    model.rope_cos, model.rope_sin,
+                    *cache.keys, *cache.values,
+                )
+                output = results[0]
+                for i in range(num_layers):
+                    cache.keys[i] = results[1 + i]
+                    cache.values[i] = results[1 + num_layers + i]
 
             if is_last:
                 # Last rank: sample a token from the logits and send back to rank 0.
@@ -465,6 +524,17 @@ def _rank0_pipeline_generate(
 
         position = prompt_tokens
 
+        # ── JIT setup for the decode loop ────────────────────────────────────
+        # Build the JIT against the cache *after* the prefill's contiguous+
+        # realize dance: prefill creates new cache tensor objects, so a JIT
+        # built before prefill would capture the wrong buffers. Persistent
+        # input buffers get `_buffer().copyin()`'d each decode step so the
+        # JIT can replay without reallocating argument tensors.
+        num_layers = len(model.layers)
+        jit_decode = _build_jit_decode(model, cache)
+        input_buf = Tensor.empty(1, 1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+        position_buf = Tensor.empty(1, dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
+
         # ── Decode loop ───────────────────────────────────────────────────────
         generation_start = time.time()
         # Accumulators to break down per-decode wall clock. Logged every N
@@ -525,26 +595,19 @@ def _rank0_pipeline_generate(
                 # causing the next request's worker loop to exit in ~ms.
                 return
 
-            # ── Decode step: embed single token on rank 0, ship hidden ────
+            # ── Decode step (JIT): embed single token, ship hidden ────
             _inst_t0 = time.perf_counter()
-            tok_tensor = Tensor([[token_id]], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-            # CRITICAL: pass position_offset as a Tensor (not int) so
-            # grouped_query_attention takes the "decode" branch that attends
-            # against cache.keys/values — otherwise it attends only to the
-            # current single token's K/V and ignores all prefill context.
-            position_tensor = Tensor([position], dtype=dtypes.int32).contiguous().realize()  # pyright: ignore[reportUnknownMemberType]
-            # Decode shape is fixed (seq_len=1), so BEAM can cache kernels;
-            # let the runner-bootstrap default (BEAM=2) apply instead of
-            # disabling BEAM as we used to.
-            decode_hidden, _ = forward_pass(
-                model, tok_tensor, cache,
-                position_offset=position_tensor,
-                rope_cos=model.rope_cos, rope_sin=model.rope_sin,
+            input_buf._buffer().copyin(memoryview(bytearray(struct.pack("=i", token_id))))  # pyright: ignore[reportPrivateUsage]
+            position_buf._buffer().copyin(memoryview(bytearray(struct.pack("=i", position))))  # pyright: ignore[reportPrivateUsage]
+            results = jit_decode(
+                input_buf, position_buf,
+                model.rope_cos, model.rope_sin,
+                *cache.keys, *cache.values,
             )
-            for i in range(len(cache.keys)):
-                cache.keys[i] = cache.keys[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-                cache.values[i] = cache.values[i].contiguous()  # pyright: ignore[reportUnknownMemberType]
-            decode_hidden = decode_hidden.contiguous().realize(*cache.keys, *cache.values)  # pyright: ignore[reportUnknownMemberType]
+            decode_hidden = results[0]
+            for i in range(num_layers):
+                cache.keys[i] = results[1 + i]
+                cache.values[i] = results[1 + num_layers + i]
             _inst_t1 = time.perf_counter()
 
             decode_np = _tensor_to_np(decode_hidden)
