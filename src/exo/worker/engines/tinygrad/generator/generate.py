@@ -379,7 +379,7 @@ def _worker_pipeline_loop(
             return
 
         if tag == TAG_HIDDEN:
-            arr = decode_hidden(payload)
+            _position_offset, arr = decode_hidden(payload)
             # arr shape: [batch, seq_len, hidden_dim]
             arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
             seq_len = int(arr_shape[1])

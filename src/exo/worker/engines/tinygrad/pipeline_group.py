@@ -23,46 +23,45 @@ TAG_TOKEN = 1
 TAG_STOP = 2
 
 _HEADER = struct.Struct("<BI")  # tag u8, length u32-le
-_HIDDEN_SHAPE = struct.Struct("<HIH")  # batch u16, seq_len u32, hidden_dim u16
+_HIDDEN_HEADER = struct.Struct("<IHIH")  # position_offset u32, batch u16, seq_len u32, hidden_dim u16
 _TOKEN_PAYLOAD = struct.Struct("<iB")  # token_id i32-le, stop u8
 
 
-def encode_hidden(arr: np.ndarray[Any, np.dtype[np.uint16]]) -> bytes:
-    # Wire format: bf16 bytes, carried as uint16 since numpy has no native
-    # bf16 dtype. bf16 has fp32's exponent range (no saturation on residual
-    # streams that exceed ~65504) while using half the bandwidth of fp32.
-    # Callers should cast their Tensor to bfloat16 and bitcast to uint16
-    # before passing the resulting ndarray in.
+def encode_hidden(
+    arr: np.ndarray[Any, np.dtype[np.uint16]],
+    position_offset: int = 0,
+) -> bytes:
+    # Wire format: <position_offset:u32><batch:u16><seq_len:u32><hidden_dim:u16>
+    # followed by raw bf16 bytes (carried as uint16 since numpy has no bf16).
+    # position_offset signals which cache position range the hidden should
+    # be written at on the receiving rank — 0 means fresh session.
     assert arr.dtype == np.uint16 and arr.ndim == 3
     batch = cast(int, arr.shape[0])
     seq_len = cast(int, arr.shape[1])
     hidden_dim = cast(int, arr.shape[2])
     assert batch < 2**16 and hidden_dim < 2**16, "shape overflows u16"
-    shape_hdr = _HIDDEN_SHAPE.pack(batch, seq_len, hidden_dim)
-    return shape_hdr + arr.tobytes()
+    assert 0 <= position_offset < 2**32, "position_offset overflows u32"
+    header = _HIDDEN_HEADER.pack(position_offset, batch, seq_len, hidden_dim)
+    return header + arr.tobytes()
 
 
-def decode_hidden(buf: bytes) -> np.ndarray[Any, np.dtype[np.uint16]]:  # noqa: D401
-    """Decode a HIDDEN-frame payload.
-
-    Returns a *writable* uint16 ndarray carrying bf16 bit patterns.
-    `np.frombuffer` on `bytes` produces a read-only array, which
-    tinygrad's CUDA copyin rejects with
-    ``TypeError: underlying buffer is not writable``; we copy once
-    here so callers can pass the result straight into
-    ``Tensor(arr).bitcast(dtypes.bfloat16)``.
-    """
-    raw = _HIDDEN_SHAPE.unpack_from(buf, 0)
-    batch = cast(int, raw[0])
-    seq_len = cast(int, raw[1])
-    hidden_dim = cast(int, raw[2])
-    expected_bytes = batch * seq_len * hidden_dim * 2  # bf16 = 2 bytes per element
-    actual_bytes = len(buf) - _HIDDEN_SHAPE.size
+def decode_hidden(
+    buf: bytes,
+) -> tuple[int, np.ndarray[Any, np.dtype[np.uint16]]]:
+    # Returns (position_offset, writable uint16 ndarray carrying bf16 bits).
+    raw = _HIDDEN_HEADER.unpack_from(buf, 0)
+    position_offset = cast(int, raw[0])
+    batch = cast(int, raw[1])
+    seq_len = cast(int, raw[2])
+    hidden_dim = cast(int, raw[3])
+    expected_bytes = batch * seq_len * hidden_dim * 2  # bf16 = 2 bytes/element
+    actual_bytes = len(buf) - _HIDDEN_HEADER.size
     assert actual_bytes == expected_bytes, (
-        f"decode_hidden: wire corruption — expected {expected_bytes} data bytes, got {actual_bytes}"
+        f"decode_hidden: wire corruption — expected {expected_bytes} data bytes, "
+        f"got {actual_bytes}"
     )
-    data = np.frombuffer(buf[_HIDDEN_SHAPE.size :], dtype=np.uint16)
-    return data.reshape(batch, seq_len, hidden_dim).copy()
+    data = np.frombuffer(buf[_HIDDEN_HEADER.size:], dtype=np.uint16)
+    return position_offset, data.reshape(batch, seq_len, hidden_dim).copy()
 
 
 def encode_token(token_id: int, stop: bool) -> bytes:
@@ -208,10 +207,14 @@ class PipelineGroup:
             send_sock=send_sock,
         )
 
-    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
-        _send_frame(self.send_sock, TAG_HIDDEN, encode_hidden(arr))
+    def send_hidden(
+        self,
+        arr: np.ndarray[Any, np.dtype[np.uint16]],
+        position_offset: int = 0,
+    ) -> None:
+        _send_frame(self.send_sock, TAG_HIDDEN, encode_hidden(arr, position_offset))
 
-    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
+    def recv_hidden(self) -> tuple[int, np.ndarray[Any, np.dtype[np.uint16]]]:
         tag, payload = _recv_frame(self.recv_sock)
         if tag != TAG_HIDDEN:
             raise RuntimeError(f"expected HIDDEN, got tag={tag}")

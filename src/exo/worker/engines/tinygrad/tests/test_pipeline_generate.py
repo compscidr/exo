@@ -129,7 +129,8 @@ class _FakeGroup(PipelineGroup):
     inbound_queue: list[tuple[int, bytes]]
 
     # Records of what the SUT sent to the "next" rank.
-    sent_hiddens: list[np.ndarray[Any, np.dtype[np.uint16]]]
+    # Each entry is (position_offset, arr) so tests can assert on position too.
+    sent_hiddens: list[tuple[int, np.ndarray[Any, np.dtype[np.uint16]]]]
     sent_tokens: list[tuple[int, bool]]
     sent_stops: int
 
@@ -149,10 +150,14 @@ class _FakeGroup(PipelineGroup):
 
     # ── Overridden transport methods ─────────────────────────────────────
 
-    def send_hidden(self, arr: np.ndarray[Any, np.dtype[np.uint16]]) -> None:
-        self.sent_hiddens.append(arr)
+    def send_hidden(
+        self,
+        arr: np.ndarray[Any, np.dtype[np.uint16]],
+        position_offset: int = 0,
+    ) -> None:
+        self.sent_hiddens.append((position_offset, arr))
 
-    def recv_hidden(self) -> np.ndarray[Any, np.dtype[np.uint16]]:
+    def recv_hidden(self) -> tuple[int, np.ndarray[Any, np.dtype[np.uint16]]]:
         tag, payload = self.recv_any()
         if tag != TAG_HIDDEN:
             raise RuntimeError(f"expected HIDDEN, got tag={tag}")
@@ -286,7 +291,7 @@ def test_pipeline_rank0_sends_hidden_recvs_token(tmp_path: Path) -> None:
     assert len(group.sent_hiddens) >= 1, "expected at least one send_hidden call"
 
     # All send_hidden calls must pass a 3-D fp16 ndarray.
-    for arr in group.sent_hiddens:
+    for _pos, arr in group.sent_hiddens:
         arr_shape: tuple[int, ...] = arr.shape  # pyright: ignore[reportAny]
         assert arr.dtype == np.uint16, f"expected uint16, got {arr.dtype}"
         assert len(arr_shape) == 3, f"expected 3-D hidden, got {len(arr_shape)}-D"
@@ -353,7 +358,7 @@ def test_worker_loop_processes_hidden_and_sends(tmp_path: Path) -> None:
 
     # send_hidden must have been called once with a 3-D fp16 ndarray.
     assert len(group.sent_hiddens) == 1
-    sent = group.sent_hiddens[0]
+    _sent_pos, sent = group.sent_hiddens[0]
     sent_shape: tuple[int, ...] = sent.shape  # pyright: ignore[reportAny]
     assert sent.dtype == np.uint16
     assert len(sent_shape) == 3
@@ -429,7 +434,7 @@ def test_pipeline_rank0_prefill_unpadded(tmp_path: Path) -> None:
 
     # The first send_hidden must be the prefill.
     assert len(group.sent_hiddens) >= 1, "expected at least one send_hidden call"
-    prefill_hidden = group.sent_hiddens[0]
+    _prefill_pos, prefill_hidden = group.sent_hiddens[0]
     prefill_shape: tuple[int, ...] = prefill_hidden.shape  # pyright: ignore[reportAny]
 
     # prompt_tokens == 3 (StubTokenizer always encodes to [1, 2, 3]).

@@ -31,10 +31,18 @@ def test_encode_decode_token_roundtrip() -> None:
 
 def test_encode_decode_hidden_roundtrip() -> None:
     arr = np.arange(12, dtype=np.uint16).reshape(1, 3, 4)
-    buf = encode_hidden(arr)
-    out = decode_hidden(buf)
+    buf = encode_hidden(arr, position_offset=123)
+    position, out = decode_hidden(buf)
+    assert position == 123
     assert out.shape == arr.shape  # pyright: ignore[reportAny]
     assert np.array_equal(out, arr)
+
+
+def test_encode_hidden_defaults_position_to_zero() -> None:
+    arr = np.zeros((1, 1, 8), dtype=np.uint16)
+    buf = encode_hidden(arr)
+    position, _ = decode_hidden(buf)
+    assert position == 0
 
 
 def test_two_rank_ring_localhost_token_roundtrip() -> None:
@@ -84,8 +92,9 @@ def test_two_rank_ring_localhost_token_roundtrip() -> None:
 
     # Hidden state: rank 0 -> rank 1
     arr = np.arange(24, dtype=np.uint16).reshape(1, 6, 4)
-    groups[0].send_hidden(arr)
-    recv = groups[1].recv_hidden()
+    groups[0].send_hidden(arr, position_offset=42)
+    recv_pos, recv = groups[1].recv_hidden()
+    assert recv_pos == 42
     assert recv.shape == arr.shape  # pyright: ignore[reportAny]
     assert np.array_equal(recv, arr)
 
